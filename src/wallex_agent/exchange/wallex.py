@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import re
+import socket
 import ssl
 import threading
 import time
@@ -77,7 +78,9 @@ _INT_STR_RE = re.compile(r"-?[0-9]{1,18}")
 _HOST_RE = re.compile(r"[a-z0-9.-]{1,253}")
 _KEY_TEXT_RE = re.compile(r"(?i)((?:x[-_ ]?)?api[-_ ]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;&}]+")
 _MAX_ABS_EXPONENT = 40
-_TEXT_WINDOW = 16_000      # scrub this much text BEFORE truncating, so no partial key survives
+# Error texts are always scrubbed in FULL and only then truncated: cutting first could leave the
+# prefix of a key that straddles the cut, which the scrubber (exact matching) would not recognise.
+# (Bodies are already bounded by the transport's response cap.)
 
 # Path deny-list, checked before the allow-list: substrings anywhere, or whole path segments.
 _DENY_SUBSTRINGS = ("withdraw", "transfer", "deposit", "wallgate")
@@ -191,10 +194,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _socket_of(resp: Any) -> Any:
+    """The socket under an ``http.client`` response (or under the response an ``HTTPError``
+    wraps), or None (test doubles, unknown objects)."""
+    for obj in (resp, getattr(resp, "fp", None)):
+        raw = getattr(getattr(obj, "fp", None), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None and callable(getattr(sock, "settimeout", None)):
+            return sock
+    return None
+
+
+def _abort_socket(sock: Any, fired: threading.Event) -> None:
+    """Watchdog: at the deadline, shut the socket down so a blocked read returns at once. The base
+    ``socket.socket.shutdown`` touches only the descriptor (also for an ``SSLSocket``)."""
+    fired.set()
+    try:
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 class UrllibTransport:
     """Default stdlib transport: verified TLS >= 1.2, no redirects, no environment proxies (unless
     asked), no retries, response body capped (reads at most ``max_response_bytes + 1`` bytes so
-    the client can detect the overflow), and a total deadline of ``timeout`` for reading."""
+    the client can detect the overflow), and a TOTAL deadline of ``timeout`` for reading the body:
+    each read is a single ``read1`` with the socket timeout set to the time left, and a watchdog
+    shuts the socket down at the deadline (a peer dripping one byte at a time, also inside chunked
+    framing, cannot hold a request open)."""
 
     def __init__(self, *, max_response_bytes: int = MAX_RESPONSE_BYTES,
                  use_env_proxy: bool = False, opener: Any = None) -> None:
@@ -245,21 +272,39 @@ class UrllibTransport:
     def _read_bounded(self, resp: Any, deadline: float) -> bytes:
         if getattr(resp, "fp", True) is None:    # HTTPError without a body
             return b""
+        sock = _socket_of(resp)
+        read = getattr(resp, "read1", None)       # at most ONE underlying recv per call
+        if not callable(read):
+            read = resp.read
+        fired = threading.Event()
+        watchdog: threading.Timer | None = None
+        if sock is not None:
+            watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), _abort_socket, (sock, fired))
+            watchdog.daemon = True
+            watchdog.start()
         chunks: list[bytes] = []
         total = 0
         failure: str | None = None
         try:
             while total <= self._max:
-                if time.monotonic() > deadline:
+                left = deadline - time.monotonic()
+                if left <= 0:
                     failure = "response read deadline exceeded"
                     break
-                chunk = resp.read(min(65536, self._max + 1 - total))
+                if sock is not None:
+                    sock.settimeout(left)         # a single recv can never outlive the deadline
+                chunk = read(min(65536, self._max + 1 - total))
                 if not chunk:
                     break
                 chunks.append(chunk)
                 total += len(chunk)
         except (http.client.HTTPException, OSError, ValueError) as exc:
             failure = f"{type(exc).__name__} while reading the response"
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+        if fired.is_set():
+            failure = "response read deadline exceeded"
         if failure is not None:
             raise TransportError(failure)
         return b"".join(chunks)
@@ -580,8 +625,8 @@ class WallexClient:
         doc = self._decode_json(resp, f"DELETE {prep.path}")
         if not isinstance(doc, dict) or ("success" in doc and doc["success"] is not True):
             msg = doc.get("message") if isinstance(doc, dict) else None
-            detail = f" (message: {msg[:_TEXT_WINDOW]})" if isinstance(msg, str) else ""
-            raise SchemaError(self._scrub(
+            detail = f" (message: {msg})" if isinstance(msg, str) else ""
+            raise SchemaError(self._scrub(      # scrub the WHOLE text, then truncate
                 f"DELETE {prep.path}: 2xx answer does not confirm the cancel{detail}")[:300])
         return None
 
@@ -668,7 +713,7 @@ class WallexClient:
             result = self._transport.request(prep.method, prep.url, prep.headers, prep.body,
                                              self._timeout)
         except Exception as exc:  # noqa: BLE001 - for a write every failure is "outcome unknown"
-            failure = f"{type(exc).__name__}: {_safe_str(exc)[:_TEXT_WINDOW]}"
+            failure = f"{type(exc).__name__}: {_safe_str(exc)}"     # scrubbed in full below
         if failure is not None:
             raise TransportError(self._scrub(
                 f"{prep.method} {prep.path}: transport failure: {failure}")[:500])
@@ -814,13 +859,13 @@ class WallexClient:
             raise SchemaError(f"{ctx}: top-level JSON is {_jtype(doc)}, expected object")
         if doc.get("success") is not True:
             msg = doc.get("message")
-            detail = f" (message: {msg[:_TEXT_WINDOW]})" if isinstance(msg, str) else ""
+            detail = f" (message: {msg})" if isinstance(msg, str) else ""
             raise SchemaError(self._scrub(f"{ctx}: 'success' is not true{detail}")[:300])
         if "result" not in doc:
             raise SchemaError(f"{ctx}: missing 'result'")
 
     def _error_text(self, raw: bytes) -> str:
-        return self._scrub(raw[:_TEXT_WINDOW].decode("utf-8", errors="replace"))[:500]
+        return self._scrub(raw.decode("utf-8", errors="replace"))[:500]    # scrub, THEN truncate
 
     def _backoff(self, attempt: int) -> float:
         return min(BACKOFF_CAP_S, BACKOFF_BASE_S * (2 ** attempt))
@@ -918,11 +963,12 @@ def _try_json(raw: bytes) -> Any:
 
 
 def _message_of(raw: bytes) -> str:
-    """Server-provided error text (JSON ``message`` if present), bounded; NOT yet scrubbed."""
+    """Server-provided error text (JSON ``message`` if present), COMPLETE and NOT yet scrubbed:
+    callers scrub the whole text first and truncate afterwards."""
     doc = _try_json(raw)
     if isinstance(doc, dict) and isinstance(doc.get("message"), str):
-        return doc["message"][:_TEXT_WINDOW]
-    return raw[:_TEXT_WINDOW].decode("utf-8", errors="replace")
+        return doc["message"]
+    return raw.decode("utf-8", errors="replace")
 
 
 def _rejection_details(raw: bytes) -> tuple[str, int | None]:

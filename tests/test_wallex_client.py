@@ -1351,6 +1351,150 @@ def test_transport_total_read_deadline(monkeypatch):
         tr.request("GET", "https://api.wallex.ir/v1/markets", {}, None, 5.0)
 
 
+class _FakeSock:
+    def __init__(self):
+        self.timeouts = []
+        self.shutdowns = 0
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+
+class _DripResponse:
+    """Models http.client semantics on a peer that drips ONE byte every ``step`` seconds:
+    ``read(n)`` blocks until n bytes / EOF (the old code path), ``read1(n)`` returns after one
+    recv. Time is a fake monotonic clock advanced by each recv."""
+
+    def __init__(self, body: bytes, clock: list, step: float):
+        self.status, self.headers = 200, {}
+        self._body, self._clock, self._step = body, clock, step
+        self.sock = _FakeSock()
+        self.fp = type("BR", (), {"raw": type("SIO", (), {"_sock": self.sock})()})()
+
+    def _recv_one(self) -> bytes:
+        if not self._body:
+            return b""
+        self._clock[0] += self._step
+        b, self._body = self._body[:1], self._body[1:]
+        return b
+
+    def read1(self, n=-1):
+        return self._recv_one()
+
+    def read(self, n=-1):                     # blocking read: drains everything, however long it takes
+        out = b""
+        while True:
+            b = self._recv_one()
+            if not b:
+                return out
+            out += b
+
+    def close(self):
+        pass
+
+
+def test_transport_bounds_the_total_read_time_against_a_dripping_peer(monkeypatch):
+    """L2: each byte arrives before the per-socket timeout, so only a TOTAL bound stops it: one
+    read1 per recv, the socket timeout set to the time left before each, the deadline checked."""
+    clock = [0.0]
+    monkeypatch.setattr(wx.time, "monotonic", lambda: clock[0])
+    resp = _DripResponse(b" " * 1000 + b'{"success":true}', clock, step=0.6)
+    tr = UrllibTransport(opener=FakeOpener(resp))
+    with pytest.raises(TransportError, match="deadline"):
+        tr.request("GET", "https://api.wallex.ir/v1/markets", {}, None, 5.0)
+    assert clock[0] <= 5.0 + 0.6                       # stopped within one drip of the deadline
+    assert resp.sock.timeouts and all(0 < t <= 5.0 for t in resp.sock.timeouts)
+    assert resp.sock.timeouts == sorted(resp.sock.timeouts, reverse=True)   # always the time LEFT
+
+
+def _local_http_response(head: bytes, drip: bytes, interval: float):
+    """A real http.client response over a local socketpair (no network); the peer sends ``head``
+    at once and then ``drip`` one byte every ``interval`` seconds from a thread."""
+    import threading
+    import time as _t
+    a, b = socket.socketpair()
+
+    def peer():
+        try:
+            b.sendall(head)
+            for i in range(len(drip)):
+                _t.sleep(interval)
+                b.sendall(drip[i:i + 1])
+        except OSError:
+            pass
+    threading.Thread(target=peer, daemon=True).start()
+    resp = http.client.HTTPResponse(a, method="GET")
+    resp.begin()
+    return resp, a, b
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_transport_deadline_on_a_real_socket_dripping_body_or_chunk_size(chunked):
+    """L2 on real http.client objects: a Content-Length body dripped byte by byte, and a chunked
+    body whose chunk-size LINE is dripped (read inside http.client's readline: only the watchdog
+    can bound that). Either way the read ends at the deadline with a TransportError."""
+    import time as _t
+    if chunked:
+        head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        drip = b"0" * 200 + b"5\r\nhello\r\n0\r\n\r\n"
+    else:
+        head = b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n"
+        drip = b" " * 200
+    resp, a, b = _local_http_response(head, drip, interval=0.02)
+    tr = UrllibTransport(opener=FakeOpener(resp))
+    t0 = _t.monotonic()
+    try:
+        with pytest.raises(TransportError, match="deadline|reading"):
+            tr._read_bounded(resp, _t.monotonic() + 0.4)
+    finally:
+        a.close()
+        b.close()
+    assert _t.monotonic() - t0 < 2.0                   # the peer would need ~4.3 s
+
+
+def test_transport_reads_a_normal_real_response_completely():
+    import time as _t
+    body = b'{"success":true,"message":"ok","result":{}}'
+    resp, a, b = _local_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body,
+                                      b"", interval=0.0)
+    try:
+        assert UrllibTransport(opener=FakeOpener(resp))._read_bounded(resp, _t.monotonic() + 5) == body
+    finally:
+        a.close()
+        b.close()
+
+
+@pytest.mark.parametrize("key_len", [48, 512])
+def test_no_key_prefix_survives_truncation_at_any_boundary(key_len):
+    """I1 / R8: the key is scrubbed from the WHOLE text before it is cut; a key straddling the old
+    16 000-char window used to leave its prefix in the kept message."""
+    import random
+    rnd = random.Random(key_len)
+    key = "".join(rnd.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789") for _ in range(key_len))
+    body = (key * (16000 // key_len)).encode()
+    body += b"." * max(0, 16000 - len(body) - key_len // 4) + key.encode() + b" tail"
+    prefixes = {key[:n] for n in (8, 16, key_len // 4)}
+
+    class Tr:
+        def request(self, *a, **k):
+            return 500, {}, body
+
+    c = WallexClient(key, transport=Tr(), clock=SimClock(), max_read_retries=0)
+    with pytest.raises(ServerError) as ei:
+        c.create_order(OrderRequest("wa-1", "BTCUSDT", Side.BUY, D("1"), D("1")))
+    for text in (ei.value.body, str(ei.value)):
+        assert not any(p in text for p in prefixes), "key prefix survived the truncation"
+    for status in (401, 422, 404):
+        class Tr2:
+            def request(self, *a, **k):
+                return status, {}, json.dumps({"message": body.decode(), "result": {"error_code": 1006}}).encode()
+        c2 = WallexClient(key, transport=Tr2(), clock=SimClock(), max_read_retries=0)
+        with pytest.raises(ExchangeError) as ei:
+            c2.create_order(OrderRequest("wa-2", "BTCUSDT", Side.BUY, D("1"), D("1")))
+        assert not any(p in str(ei.value) for p in prefixes)
+        assert not any(p in str(getattr(ei.value, "message", "")) for p in prefixes)
+
+
 @pytest.mark.parametrize("url", ["http://api.wallex.ir/v1/markets", "file:///etc/passwd",
                                  "ftp://api.wallex.ir/", None])
 def test_transport_refuses_non_https(url):
