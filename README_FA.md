@@ -74,7 +74,9 @@ python -m wallex_agent --version
 
 خروجی باید `wallex-agent 0.4.0` باشد. دستور `wallex-agent` (بعد از فعال کردن venv) دقیقاً معادل `python -m wallex_agent` است.
 
-> همهٔ دستورها را **از داخل پوشهٔ پروژه** اجرا کنید. فایل `.env` و پوشهٔ `state` به‌صورت پیش‌فرض نسبت به پوشهٔ جاری خوانده/نوشته می‌شوند. (گزینه‌های سراسری `--env-file` و `--data-dir` باید **قبل** از نام فرمان بیایند، مثلاً `python -m wallex_agent --data-dir D:\wa-state status`.)
+> همهٔ دستورها را **از داخل پوشهٔ پروژه** اجرا کنید. فایل `.env` به‌صورت پیش‌فرض از پوشهٔ جاری خوانده می‌شود و `DATA_DIR` نسبی (مثل `state`) نسبت به پوشهٔ جاری **به یک مسیر مطلق تبدیل می‌شود**؛ همهٔ فرمان‌ها مسیرها را کامل (مطلق) چاپ می‌کنند تا معلوم باشد دقیقاً کدام پوشه را می‌خوانند. (گزینه‌های سراسری `--env-file` و `--data-dir` باید **قبل** از نام فرمان بیایند، مثلاً `python -m wallex_agent --data-dir D:\wa-state status`.)
+>
+> **حالت live بدون `DATA_DIR` صریح اجرا نمی‌شود:** `DATA_DIR` باید در `.env`، در محیط، یا با `--data-dir` داده شده باشد (شرط `data_dir_explicit` در دروازه). دلیل: اجرای همان فرمان از پوشهٔ دیگری بی‌صدا یعنی دفتر، شواهد و فایل KILL دیگری. برای live بهتر است مسیر **مطلق** بنویسید.
 
 ## ۴. پیکربندی (`.env`)
 
@@ -83,14 +85,14 @@ python -m wallex_agent --version
 | متغیر | پیش‌فرض | معنی |
 |---|---|---|
 | `WALLEX_API_KEY` | خالی | کلید API. فقط برای `check-live`، `canary`، `arm-live`، `live` و `kill --cancel-open` لازم است. در هیچ خروجی، لاگ یا گزارشی چاپ نمی‌شود. |
-| `TRADING_MODE` | `paper` | فقط حالت پیش‌فرضِ `--mode` برای `status`، `report`، `trace` و `kill` است. فرمان `live` همیشه live است و فرمان `paper` همیشه paper؛ این متغیر به‌تنهایی معاملهٔ واقعی را روشن نمی‌کند. |
+| `TRADING_MODE` | `paper` | فقط حالت پیش‌فرضِ `--mode` برای `status`، `report`، `trace` و `unstop` است. فرمان `live` همیشه live است و فرمان `paper` همیشه paper؛ این متغیر به‌تنهایی معاملهٔ واقعی را روشن نمی‌کند. `kill --cancel-open` به آن اعتنا نمی‌کند (بخش ۱۳). |
 | `PROFILE` | `conservative` | `conservative` یا `competition` (جدول بعدی). |
 | `INITIAL_TMN` | `5000000` | سرمایهٔ اولیه به تومان. در live باید **کمتر یا مساوی موجودی واقعی TMN** حساب باشد. عبارت تأیید (`START LIVE 5000000`) هم از همین عدد ساخته می‌شود. |
 | `COMPETITION_HOURS` | `24` | طول مسابقه از لحظهٔ اولین شروع ربات (بین ۰ تا ۱۶۸). |
 | `MAX_EXPOSURE_FRACTION` | `0.25` | حداکثر سهمی از ارزش دلاری حساب (USDT + BTC) که می‌تواند BTC باشد. |
 | `ENABLE_LIVE` | `false` | فقط وقتی `true` باشد دروازهٔ live اجازه می‌دهد (به‌علاوهٔ بقیهٔ شرط‌ها). |
 | `FINAL_POLICY` | `report_only` | با دارایی‌ها در پایان مسابقه چه شود (بخش ۴-۲). |
-| `DATA_DIR` | `state` | پوشهٔ وضعیت، شواهد، گزارش‌ها و لاگ‌ها. |
+| `DATA_DIR` | `state` | پوشهٔ وضعیت، شواهد، گزارش‌ها، لاگ‌ها و فایل KILL. هنگام بارگذاری به مسیر مطلق تبدیل می‌شود (مسیر نسبی نسبت به پوشهٔ جاری). **برای live باید صریحاً تنظیم شده باشد** و بهتر است مطلق باشد. |
 | `API_BASE` | `https://api.wallex.ir` | تغییرش ندهید. کلید فقط به `api.wallex.ir` روی HTTPS فرستاده می‌شود. |
 | `WALLEX_USE_ENV_PROXY` | `false` | اگر `true` باشد، پروکسی تنظیم‌شده در `HTTP(S)_PROXY` استفاده می‌شود (بخش ۱۱). |
 | `PAPER_FEE_RATE` | `0.0035` | کارمزد **فرضی** هر طرف، فقط برای paper و backtest. حالت live همیشه کارمزد واقعی حساب را از API می‌خواند. |
@@ -98,12 +100,14 @@ python -m wallex_agent --version
 | `MAX_DRAWDOWN_PCT` | `0.08` | افت از اوج ارزش حساب که بعد از آن فقط خروج مجاز است و سپس ربات STOPPED می‌شود. |
 | `MAX_ROUND_TRIPS` | `4` | حداکثر تعداد دور خرید و فروش BTC. |
 | `MIN_NET_EDGE_BPS` | `30` | حداقل سود مورد انتظار **پس از کسر کارمزد، اسپرد و لغزش**، به واحد bps (۱bps = ۰٫۰۱٪). |
-| `MAX_SPREAD_BPS` | `40` | اگر اسپرد بیشتر باشد، ورود ممنوع است. |
-| `MAX_SLIPPAGE_BPS` | `25` | حداکثر فاصلهٔ قیمت سفارش از بهترین قیمت در BTCUSDT. |
+| `MAX_SPREAD_BPS` | `40` | اگر اسپرد بیشتر باشد، ورود ممنوع است. مقدار بیش از ۵۰۰ پذیرفته نمی‌شود. |
+| `MAX_SLIPPAGE_BPS` | `25` | حداکثر فاصلهٔ قیمت سفارش از بهترین قیمت در BTCUSDT. مقدار بیش از ۲۰۰ پذیرفته نمی‌شود. |
 | `MIN_CONFIDENCE` | `0.55` | حداقل اطمینان ایجنت برای ورود. |
 | `LOOP_INTERVAL_S` | `30` | فاصلهٔ بین چرخه‌ها در live (ثانیه). در paper با `--interval` تعیین می‌شود. |
 | `ORDER_TIMEOUT_S` | `20` | سفارشی که تا این زمان کامل پر نشود، لغو و بررسی می‌شود. |
 | `SEED` | `42` | بذر تصادفی برای تکرارپذیری. |
+
+مقدارهای بی‌معنی یا خطرناک در `.env` رد می‌شوند و فرمان با کد ۲ (`configuration error`) خارج می‌شود؛ مثلاً `MAX_SLIPPAGE_BPS` بیش از ۲۰۰، `MAX_SPREAD_BPS` بیش از ۵۰۰، `STOP_LOSS_PCT` بیش از ۰٫۵، `MIN_NET_EDGE_BPS` بیش از ۱۰۰۰۰، `MAX_ROUND_TRIPS` بیش از ۱۰۰، یا `LOOP_INTERVAL_S`/`ORDER_TIMEOUT_S` بیش از ۳۶۰۰. چنین مقدارهایی عملاً یک دروازهٔ ریسک را خاموش می‌کردند.
 
 ### ۴-۱. پروفایل `conservative` (پیش‌فرض) در برابر `competition`
 
@@ -155,12 +159,12 @@ python -m wallex_agent --version
 python -m wallex_agent demo
 ```
 
-این فرمان یک بک‌تست ۲۴ ساعتهٔ **مصنوعی** را اجرا می‌کند و روی سیستم سازنده حدود ۱۵ ثانیه طول کشید. خروجی واقعی (۲۰۲۶-۱۰-۲۲):
+این فرمان یک بک‌تست ۲۴ ساعتهٔ **مصنوعی** را اجرا می‌کند و روی سیستم سازنده حدود ۱۵ ثانیه طول کشید. خروجی واقعی (۲۰۲۶-۱۰-۲۲؛ مسیرها اکنون **مطلق** چاپ می‌شوند و اینجا با `...` کوتاه شده‌اند):
 
 ```text
 == DEMO: offline synthetic 24 h backtest (SYNTHETIC, no network, no key) ==
-   SYNTHETIC DATA (seeded random model, not market data); fills SIMULATED; fee ASSUMED
-run:        backtest-20261022T194148Z-cf3f95
+   SYNTHETIC DATA (seeded random model, not market data); fills SIMULATED; fee ASSUMED; timestamps are SIMULATED time
+run:        backtest-20261022T212026Z-79295c
 status:     deadline (exit 0) - competition deadline reached (final_policy=report_only); holdings: 0.00000000396 BTC, 27374.72 TMN, 18.24975892585525 USDT
 period:     2023-11-14T22:13:20Z -> 2023-11-15T22:13:20Z (24.0 h)
 decisions:  BUY_BTC 2, CONVERT_TMN_USDT 1, HOLD 1435, SELL_BTC 2
@@ -169,13 +173,13 @@ value:      5,000,000 TMN -> 5,002,273 TMN net of exit costs (P&L 2272.76 TMN, 0
 target:     Target 2x NOT reached: final/initial = 1.0005x net of exit costs
 fees paid:  0.00000037604 BTC, 0.09594171194475 USDT
 holdings:   0.00000000396 BTC, 27374.72 TMN, 18.24975892585525 USDT
-report:     state\backtest\runs\backtest-20261022T194148Z-cf3f95\final_report.json
-trace:      state\backtest\runs\backtest-20261022T194148Z-cf3f95\trace.txt
-audit:      state\backtest\runs\backtest-20261022T194148Z-cf3f95\audit.jsonl (hash chain OK)
+report:     C:\...\wallex-agent\state\backtest\runs\backtest-20261022T212026Z-79295c\final_report.json
+trace:      C:\...\wallex-agent\state\backtest\runs\backtest-20261022T212026Z-79295c\trace.txt
+audit:      C:\...\wallex-agent\state\backtest\runs\backtest-20261022T212026Z-79295c\audit.jsonl (hash chain OK)
 Past (simulated) results do not predict future results; 2x is not guaranteed.
 ```
 
-این عددها روی دادهٔ **مصنوعی** به دست آمده‌اند و هیچ چیزی دربارهٔ عملکرد واقعی نمی‌گویند. تاریخ‌های ۲۰۲۳ ساعت شبیه‌سازی‌شدهٔ دمو هستند. حدود ۲۷ هزار تومان باقی‌مانده هم طبیعی است: ربات برای کارمزد و لغزش جا نگه می‌دارد و باقی‌مانده کمتر از حداقل سفارش `USDTTMN` (۵۰٬۰۰۰ تومان) است.
+این عددها روی دادهٔ **مصنوعی** به دست آمده‌اند و هیچ چیزی دربارهٔ عملکرد واقعی نمی‌گویند. تاریخ‌های ۲۰۲۳ ساعت **شبیه‌سازی‌شدهٔ** دمو هستند (گزارش این را با `"clock": "simulated"` و برچسب `simulated_clock` صریحاً می‌گوید). حدود ۲۷ هزار تومان باقی‌مانده هم طبیعی است: ربات برای کارمزد و لغزش جا نگه می‌دارد و باقی‌مانده کمتر از حداقل سفارش `USDTTMN` (۵۰٬۰۰۰ تومان) است.
 
 برای دیدن وضعیت و ردِ تصمیم‌ها (دمو در حالت backtest است، پس `--mode backtest` لازم است):
 
@@ -256,23 +260,29 @@ python -m wallex_agent live --stage full --i-understand-real-money
 state/
   selftest.json, live_schema_attestation.json, live_canary.json   (live gate evidence)
   KILL, LIVE_ARMED                                                (only if created)
-  backtest/runs/<run_id>/   state.db, audit.jsonl, trace.txt, final_report.json
-  paper/runs/<run_id>/      state.db, audit.jsonl, trace.txt, final_report.json
-  live/state.db             (one ledger, kept across restarts)
+  backtest/runs/<run_id>/   state.db, instance.lock, audit.jsonl, trace.txt, final_report.json
+  paper/runs/<run_id>/      state.db, instance.lock, audit.jsonl, trace.txt, final_report.json
+  live/state.db, live/instance.lock   (one ledger, kept across restarts)
   live/runs/live-<id>/      audit.jsonl, trace.txt, final_report.json | partial_report.json
+                            [final_report.rebuilt.json  (only from `report`)]
 ```
 
 - **`final_report.json`** وقتی ساخته می‌شود که اجرا تمام شده باشد (`deadline`، `session_end`، پایان داده، `killed`، `stopped`). اگر اجرا قطع شده باشد (Ctrl+C) یا فقط مرحلهٔ تبدیل اجرا شده باشد، نام فایل `partial_report.json` است. کلیدهای مهم:
 
   | کلید | معنی |
   |---|---|
-  | `labels` | برچسب‌های صادقانه، مثل `synthetic_data`، `assumed_fee`، `paper_no_real_orders` |
+  | `labels` | برچسب‌های صادقانه، مثل `synthetic_data`، `assumed_fee`، `paper_no_real_orders`، `simulated_clock`، و در live اگر ارزش پایانی با موجودی صرافی تأیید نشد `valuation_unverified` |
+  | `clock` / `clock_note` | `simulated` (زمان شبیه‌سازی‌شدهٔ بک‌تست/دمو) یا `real` |
   | `honest_caveats` | محدودیت‌های همین اجرا، شامل موارد API تأییدنشده |
-  | `value.initial_tmn` / `value.final_tmn_net_of_exit_costs` | ارزش اولیه و ارزش نهایی **پس از کسر هزینهٔ خروج** (فروش فوری به bid) |
+  | `value.initial_tmn` / `value.final_tmn_net_of_exit_costs` | ارزش اولیه و ارزش نهایی **پس از کسر هزینهٔ خروج** (فروش فوری به bid). مبنا: دفتر ربات (فقط پرشدن‌های ثبت‌شده) |
+  | `value.verified_against_exchange` | فقط live: آیا دفتر در پایان با موجودی واقعی صرافی خواند (`true`)، نخواند (`false`) یا صرافی در دسترس نبود (`null`) |
   | `value.final_tmn_at_mid` | ارزش به قیمت میانه (خوش‌بینانه‌تر؛ فقط برای مقایسه) |
   | `pnl.pct` / `pnl.target_statement` | سود یا زیان درصدی و جملهٔ صریح دربارهٔ رسیدن یا نرسیدن به هدف ۲x |
   | `fees_paid` / `fee_source_counts` | کارمزد پرداختی به تفکیک دارایی؛ `exchange` یعنی از معاملات صرافی خوانده شده و `estimated` یعنی تخمینی |
   | `orders.list` / `fills` / `round_trips` | همهٔ سفارش‌ها با شناسه‌ها، پرشدن‌ها، و دورهای کامل BTC |
+  | `round_trips.decisions` | **هر تصمیم غیر HOLD** (و هر تصمیمی که به سفارش رسید) با همهٔ جزئیات: `action`، `strategy`، `rationale`، `confidence`، `estimated_net_edge`، `hypothesis`، `alternatives`، `state_features`، `chosen_tool` و `tool_calls`، `risk_verdict`، `order_ids` و `orders`، `fills`، `fee_assets`، `balances`/`equity`/`drawdown` در لحظهٔ تصمیم، `outcome`/`reflection`/`result`، `timestamp` و `strategy_version` |
+  | `hold_decisions` | تعداد HOLDها به تفکیک استراتژی، به‌علاوهٔ نمونه‌ای فشرده (اولین، آخرین، و هر جا که حالت ربات عوض شد) |
+  | `orders_without_decision` | سفارش‌هایی که تصمیم ایجنت پشتشان نیست (مثل canary یا صاف کردن پایانی) |
   | `equity_curve.max_drawdown_pct` | بیشترین افت ارزش |
   | `end.holdings` / `end.final_policy_applied` | دارایی‌ها در پایان و اینکه سیاست پایانی چه کرد |
   | `decisions_by_action` / `tool_usage` / `memory` | آمار تصمیم‌ها، ابزارهای استفاده‌شده، و حافظهٔ ایجنت (bandit و کالیبراسیون) |
@@ -288,7 +298,8 @@ state/
   (شناسهٔ تصمیم را از خروجی `trace` یا از `final_report.json` بردارید. برای حالت‌های دیگر `--mode backtest` یا `--mode live` اضافه کنید.)
 
 - **`status`**: وضعیت لحظه‌ای بدون هیچ رازی. شامل حالت ربات، زمان باقی‌مانده، ارزش، سفارش‌های باز و آنچه برای live کم است (`arm_status.missing`). اجرای آن کنار یک ربات در حال کار بی‌خطر است، چون از یک کپی فقط‌خواندنی می‌خواند.
-- **`report`**: گزارش نهایی را آفلاین از روی دیتابیس بازسازی و در `final_report.json` همان اجرا **بازنویسی** می‌کند.
+- **`report`**: گزارش نهایی را آفلاین از روی دیتابیس بازسازی می‌کند و در فایل جداگانهٔ `final_report.rebuilt.json` می‌نویسد. `final_report.json` خودِ اجرا **هرگز بازنویسی نمی‌شود**. ارزش در بازسازی live همیشه «تأییدنشده» برچسب می‌خورد، چون موجودی صرافی خوانده نمی‌شود.
+- **خلاصهٔ پایان اجرای live** جملهٔ «Past (simulated) results…» را ندارد. اگر صرافی در پایان موجودی را تأیید نکند، عدد ارزش با `LEDGER-BASED, NOT verified against the exchange balances` چاپ می‌شود؛ در این حالت موجودی را در اپ والکس ببینید.
 - عدد ارزش در `status` (آخرین چرخه) و در گزارش نهایی (ارزش‌گذاری دوباره در پایان) می‌توانند کمی متفاوت باشند. در دموی بالا این دو عدد 4,999,523 و 5,002,273 تومان بودند.
 
 ## ۱۰. کلید API والکس (فقط برای live)
@@ -323,12 +334,12 @@ state/
 | `0` | موفق: پایان مسابقه، پایان داده، پایان جلسهٔ paper، یا پایان مرحلهٔ تبدیل |
 | `1` | خطای غیرمنتظره (یا شکست `selftest`) |
 | `2` | خطای استفاده یا پیکربندی (آرگومان یا مقدار بد در `.env`) |
-| `3` | دروازهٔ live رد کرد (شرط، شاهد، فلگ، عبارت تأیید یا KILL). **هیچ چیزی ارسال نشد.** |
+| `3` | دروازهٔ live رد کرد (شرط، شاهد، فلگ، عبارت تأیید، KILL، `DATA_DIR` غیرصریح، یا `--resume` روی مسابقه‌ای که هنوز شروع نشده). **هیچ چیزی ارسال نشد.** |
 | `4` | کلید توقف (kill) فعال شد: سفارش‌های باز لغو شدند (چیزی فروخته نشد)، ربات STOPPED است |
-| `5` | توقف ایمنی: ربات STOPPED است (اختلاف دفتر و صرافی، تناقض، خطاهای پیاپی، افت سرمایه) |
-| `6` | رد شد: یک پیش‌شرط برقرار نیست (مثلاً کلید نیست، موجودی canary کافی نیست، نمونهٔ دیگری در حال اجراست) |
+| `5` | توقف ایمنی: ربات STOPPED است (اختلاف دفتر و صرافی با عدد، تناقض، `late_accept`، خطاهای پیاپی، افت سرمایه)؛ یا `unstop` رد شد چون تطبیق تمیز نبود (چیزی تغییر نکرد) |
+| `6` | رد شد: یک پیش‌شرط برقرار نیست (مثلاً کلید نیست، موجودی canary کافی نیست، نمونهٔ دیگری در حال اجراست، `kill` هیچ دفتری در `DATA_DIR` پیدا نکرد، یا `unstop` با وجود فایل KILL) |
 | `7` | صرافی یا شبکه برای یک خواندن ضروری در دسترس نیست |
-| `130` | با Ctrl+C یا SIGTERM قطع شد: سفارش‌های باز لغو شدند و وضعیت قابل ادامه است |
+| `130` | با Ctrl+C یا SIGTERM قطع شد: سفارش‌های باز لغو شدند و وضعیت قابل ادامه است (برای canary: سفارش canary لغو شد) |
 
 ## ۱۳. فرمان‌ها در یک نگاه
 
@@ -342,11 +353,12 @@ state/
 | `selftest` | — | اجرای کل تست‌ها و نوشتن `selftest.json` (برای live لازم است) |
 | `check-live` | — | بررسی فقط-GET API خصوصی با کلید و نوشتن `live_schema_attestation.json` |
 | `canary` | `--i-understand-real-money` | یک سفارش واقعی، کوچک و پرنشدنی: ثبت، مشاهده و لغو؛ نوشتن `live_canary.json` |
-| `arm-live` | `--i-understand-real-money` | نوشتن فایل `LIVE_ARMED` برای systemd و `live --resume` |
-| `live` | `--stage convert\|full`، `--resume`، `--i-understand-real-money` | معاملهٔ واقعی |
+| `arm-live` | `--i-understand-real-money` | نوشتن رکورد ساخت‌یافتهٔ `LIVE_ARMED` (عبارت، هش سورس، آدرس API، `DATA_DIR`، زمان انقضا) برای systemd و `live --resume` |
+| `live` | `--stage convert\|full`، `--resume`، `--i-understand-real-money` | معاملهٔ واقعی. `--resume` فقط مسابقه‌ای را **ادامه** می‌دهد که قبلاً به‌صورت تعاملی شروع شده است |
 | `status` | `--mode`، `--run` | وضعیت |
-| `kill` | `--cancel-open`، `--reason`، `--mode` | کلید توقف |
-| `report` | `--mode`، `--run` | بازسازی `final_report.json` |
+| `kill` | `--cancel-open`، `--reason`، `--force-write` (`--mode` نادیده گرفته می‌شود) | کلید توقف. مسیر مطلق فایل KILL را چاپ می‌کند. اگر در `DATA_DIR` هیچ دفتر یا قفلی نباشد، **چیزی نمی‌نویسد** و با کد ۶ خارج می‌شود (مگر `--force-write`). `--cancel-open` هر وقت `live/state.db` وجود داشته باشد روی live عمل می‌کند، صرف‌نظر از `TRADING_MODE` |
+| `unstop` | `--mode`، `--run`، `--i-understand-real-money` | خارج کردن دفتر از STOPPED پس از بررسی انسانی: تطبیق فقط‌خواندنی، چاپ اختلاف‌ها، و فقط اگر تمیز بود انتقال به حالت واقعی (بخش ۱۰ دستورالعمل live) |
+| `report` | `--mode`، `--run` | بازسازی آفلاین گزارش در `final_report.rebuilt.json` |
 | `trace` | `--mode`، `--run`، `--last N` یا `--decision ID` | ردِ خوانای تصمیم‌ها |
 
 راهنمای دقیق هر فرمان: `python -m wallex_agent <فرمان> --help`.
@@ -357,4 +369,24 @@ state/
 python -m pytest
 ```
 
-نتیجه در ۲۰۲۶-۱۰-۲۲ روی ویندوز با پایتون 3.12.1: `2241 passed in 42.53s`. این تست‌ها با شبیه‌ساز و پاسخ‌های mock اجرا می‌شوند و هیچ سفارش واقعی‌ای نمی‌فرستند. جزئیات در [`docs/TEST_STATUS_FA.md`](docs/TEST_STATUS_FA.md).
+نتیجه در ۲۰۲۶-۱۰-۲۲ روی ویندوز با پایتون 3.12.1: `2333 passed` (حدود ۶۰ تا ۷۰ ثانیه روی سیستم سازنده). این تست‌ها با شبیه‌ساز، پاسخ‌های mock و سوکت‌های محلی (بدون شبکه) اجرا می‌شوند و هیچ سفارش واقعی‌ای نمی‌فرستند. جزئیات در [`docs/TEST_STATUS_FA.md`](docs/TEST_STATUS_FA.md).
+
+## ۱۵. مدل حفاظت (حتماً بخوانید)
+
+دروازه‌های live (فلگ، `ENABLE_LIVE`، `DATA_DIR` صریح، `selftest`، `check-live`، `canary`، عبارت تایپ‌شده، `LIVE_ARMED`، KILL و قفل تک‌نمونه) برای جلوگیری از **اشتباه و سوءاستفادهٔ خودکار یا تصادفی** طراحی شده‌اند: فرمان اشتباه، فایل کهنه، سورسی که عوض شده، حلقهٔ شروع دوبارهٔ systemd، اسکریپتی که ترمینال ندارد، یا اجرای همزمان دو نمونه. این دروازه‌ها **در برابر یک فرایند بدخواه که با همان کاربر سیستم‌عامل (یا با root) اجرا می‌شود محافظت نمی‌کنند.** چنین فرایندی می‌تواند کلید API را از `.env` یا حافظه بخواند و هر فایل شاهدی (`selftest.json`، `live_schema_attestation.json`، `live_canary.json`، `LIVE_ARMED`) را جعل کند. هش سورس و رکورد `LIVE_ARMED` امضای رمزنگاری نیستند و عمداً هم نیستند. حفاظت در برابر چنین مهاجمی کار سیستم‌عامل است: کاربر جداگانه برای سرویس، مجوزهای فایل، کلید بدون مجوز برداشت با فهرست IP مجاز، و روی لینوکس نگه داشتن شواهد در جایی که کاربر سرویس فقط بخواند و نتواند بنویسد ([`docs/VPS_SYSTEMD_FA.md`](docs/VPS_SYSTEMD_FA.md) بخش ۶).
+
+## ۱۶. ریسک‌های باقی‌ماندهٔ شناخته‌شده (رفع نشده)
+
+- **فرایند بدخواهِ هم‌کاربر یا root:** بخش ۱۵. شواهد را می‌تواند جعل کند و کلید را بخواند.
+- **پذیرش دیرهنگام یک سفارش «رهاشده» (`ABANDONED`):** اگر صرافی سفارشی را که ربات نیافته بود بعداً اجرا کند، ربات آن را پیدا می‌کند، لغو می‌کند (اگر هنوز باز باشد) و با `late_accept` متوقف می‌شود، اما **پرشدن آن سفارش هرگز وارد دفتر نمی‌شود** (رکوردش نهایی است). پس `unstop` همیشه رد می‌شود و تصمیم با انسان است (آرشیو دفتر و شروع تازه). اگر صرافی شناسهٔ ما را برنگرداند و با آن قابل جستجو نباشد، تشخیص فقط از «سفارش باز ناشناخته» یا «معاملهٔ توضیح‌ناپذیر» یا کمبود موجودی است و آن سفارش ناشناخته خودکار لغو نمی‌شود.
+- **فهرست معاملات صرافی محدود است:** بررسی «معاملهٔ توضیح‌ناپذیر» فقط معاملاتی را می‌بیند که `GET /v1/account/trades` هنوز برمی‌گرداند. در اجرای طولانی، معاملهٔ قدیمی‌تر از این پنجره دیده نمی‌شود؛ بررسی موجودی (کمبود) همچنان آن را می‌گیرد.
+- **تأخیر تسویهٔ موجودی:** کمبود موجودی در حین اجرا فقط وقتی به توقف می‌انجامد که دست‌کم ۱۵ ثانیه بعد دوباره دیده شود؛ در این فاصله هیچ سفارش تازه‌ای ارسال نمی‌شود. اگر صرافی موجودی را بیش از این دیر به‌روز کند، ممکن است توقف کاذب رخ دهد (با `unstop` پس از بررسی قابل برگشت است).
+- **مهلت کل پاسخ HTTP فقط برای بدنهٔ پاسخ است:** خواندن بدنه (با هر کدگذاری) حداکثر `http_timeout_s` طول می‌کشد، اما مرحلهٔ اتصال و خواندن سطر وضعیت و هدرها فقط مهلت «هر عملیات سوکت» را دارد و در مجموع محدود نشده است.
+- **`DATA_DIR` نسبی در `.env` «صریح» حساب می‌شود:** دروازه فقط نبودِ `DATA_DIR` را رد می‌کند. خود `.env` هم از پوشهٔ جاری خوانده می‌شود، پس دو پوشه با دو `.env` جدا یعنی دو دفتر جدا. برای live مسیر **مطلق** بنویسید (و روی VPS `--env-file`).
+- **توقف در میانهٔ یک انتظار طولانی:** پرچم توقف در حلقه و پیش از هر دور تبدیل بررسی می‌شود، اما حل یک نتیجهٔ نامعلوم (تا ۴۵ ثانیه) و مرحلهٔ هدرهای HTTP قطع نمی‌شوند. در بدترین حالت `systemctl stop` ممکن است از `TimeoutStopSec` (۶۰ ثانیه) بگذرد و systemd فرایند را بکشد؛ ثبت پیش از ارسال و تطبیق شروع بعدی این را ایمن می‌کنند، ولی یک سفارش باز ممکن است تا شروع بعدی باز بماند.
+- **کمبود موجودی وقتی سفارشی در جریان است داوری نمی‌شود** (تا وقتی سفارش حل شود، حداکثر حدود `ORDER_TIMEOUT_S`)، چون پرشدن در راه کمبود کاذب نشان می‌داد.
+- **بازتاب ناقص کلید:** پاک‌کننده کلید کامل (و شکل‌های رمزشده‌اش) را پاک می‌کند. اگر سرور فقط **بخشی** از کلید را در پاسخ بازتاب دهد، آن بخش شناخته نمی‌شود.
+- **قفل تک‌نمونه روی فایل‌سیستم شبکه‌ای** (NFS/SMB) تضمین نشده است. پوشهٔ `DATA_DIR` باید روی دیسک محلی باشد.
+- **مسیر POSIX قفل (`flock`)** روی این سیستم سازنده (ویندوز) اجرا نشده است؛ فقط بازبینی شده و تست میان‌فرایندی آن روی لینوکس اجرا خواهد شد.
+- **`unstop` برای paper** فقط دفتر را بررسی می‌کند (صرافی شبیه‌سازی‌شدهٔ جلسهٔ تمام‌شده دیگر وجود ندارد) و چون `paper` همیشه جلسهٔ تازه می‌سازد، اثر عملی ندارد.
+- **هیچ‌کدام از مسیرهای live با صرافی واقعی اجرا نشده‌اند** ([`docs/TEST_STATUS_FA.md`](docs/TEST_STATUS_FA.md)).

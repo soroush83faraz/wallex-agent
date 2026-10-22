@@ -107,9 +107,12 @@ and no balances values** (only shapes/booleans/counts). It also records the obse
 
 `SqliteStore(path: str|Path, *, clock: Clock|None=None)` (implements `EventStore`):
 SQLite WAL, `synchronous=FULL`, foreign keys, integrity check on open, all Decimals stored as TEXT,
-single-process **instance lock** (`acquire_instance_lock()` raising `RuntimeError`/custom error when
-another live process holds `<dir>/instance.lock`; stale-lock detection by PID liveness; released on
-close). API:
+single-process **instance lock** (`acquire_instance_lock()` raising `InstanceLockError` (a
+`RuntimeError`) when another process - or another store in this process - holds
+`<dir>/instance.lock`: an OS advisory lock, `flock(LOCK_EX|LOCK_NB)` on POSIX / `msvcrt.locking` on one
+fixed byte on Windows, held for the store's lifetime; the lock file is never deleted or renamed and
+the kernel releases the lock when the holder dies, so there is no PID/staleness heuristic; the
+file's pid/host JSON is informational; `probe_lock(dir)` tells whether a store is in use). API:
 `append / iter_events` (EventStore) · `kv_get(key, default=None) / kv_set(key, jsonable)` ·
 `transaction()` context manager (BEGIN IMMEDIATE) · orders: `insert_order_intent(OrderRecord)`,
 `update_order(client_id, *, lifecycle=None, **fields)` (enforces `ORDER_TRANSITIONS`; illegal →
@@ -238,6 +241,15 @@ Also an `account_value()` helper for paper reports. Seeded/deterministic.
 * Every state transition is derived from observed exchange facts, not from "I sent it".
 * Kill switch: `kill_requested()` (file `<data_dir>/KILL` or in-process flag) checked before every send.
   On kill: cancel open orders (cancel only — never sells), state STOPPED. No withdrawal code exists.
+* (2026-10-22 review fixes) Every ABANDONED order that reached the exchange stays on a permanent watch
+  list (`watched_abandoned()`, derived from the orders table) re-checked by `check_abandoned()` on every
+  poll, before every new order and at startup; found => cancel (cancel only) + STOPPED `late_accept`;
+  a quarantine lifts only after `QUARANTINE_MIN_CHECKS` (3) verified-absent re-checks each
+  >= `unknown_resolve_window_s` apart. `check_balances()`: an in-run shortfall (no order in flight)
+  blocks new orders and, confirmed >= `SHORTFALL_CONFIRM_S` later, STOPS with the numbers.
+  `convert_tmn_to_usdt(decision_id=, should_stop=)` runs the RiskGate check before EVERY round.
+  `settle_for_shutdown()` adopts-or-leaves unknown orders, then cancels open ones. `unstop_check()` /
+  `operator_unstop()` back the `unstop` command (read-only reconcile, forced transition only if clean).
 
 ## 6. `runner.py`, `modes/`, `live_gate.py`, `reporting.py`, `cli.py`  (owner: executor)
 
@@ -258,6 +270,15 @@ Also an `account_value()` helper for paper reports. Seeded/deterministic.
   ≤ 24 h old, same base_url) ∧ interactive typed phrase `START LIVE <initial_tmn>` ∧ no KILL file. Also
   provides `run_selftest()` (runs the project's pytest/unittest suite programmatically, writes the
   attestation with `source_hash`) and `source_hash()`.
+  (2026-10-22 review fixes) + `data_dir_explicit` (Config field; `load_config` makes `data_dir`
+  absolute) and `selftest_test_count` (>= `MIN_SELFTEST_TESTS` = 1000 passed) conditions; the selftest
+  runs pytest with an allow-listed environment (`selftest_env`); `source_hash` covers every file of
+  the package (any type, except `__pycache__`) plus `pyproject.toml` and `tests/**/*.py`;
+  `LIVE_ARMED` is a JSON record (`arming_record`/`write_arming`/`read_arming`/`arming_problems`:
+  phrase, source_hash, armed_at, expires_at = armed_at + competition_hours + 24 h, initial_tmn,
+  base_url, data_dir) and `live --resume` uses it ONLY to continue a competition already started in
+  the live store. MODEL: these gates stop accidents and automated misuse, not a deliberate attacker
+  running as the same OS user (who can read the key and forge evidence).
 * `reporting.py`: `AuditLog` (append-only `audit.jsonl`, fsync per line, each line has `seq`, UTC `ts`,
   `strategy_version`, `run_id`, `prev_hash`/`hash` chain; **never contains secrets**), `FinalReport` →
   `final_report.json` (config redacted, mode, start/end, initial vs final value TMN (net of exit costs) and
@@ -269,7 +290,9 @@ Also an `account_value()` helper for paper reports. Seeded/deterministic.
   endpoints, rules/fees-known check, prints USDT/TMN math), `paper`, `check-live` (GET-only schema
   attestation), `selftest`, `live` (all gates), `status`, `kill` (writes KILL file; optional
   `--cancel-open` which only cancels), `report`, `trace`. Default `TRADING_MODE=paper`. Exit codes
-  meaningful; never prints the key.
+  meaningful; never prints the key. (2026-10-22: `kill` prints the absolute KILL path and refuses
+  (exit 6) when no store/lock exists under DATA_DIR unless `--force-write`; `--cancel-open` acts on
+  the live store whenever it exists; `report` writes `final_report.rebuilt.json`; new `unstop`.)
 * Packaging extras (owner of §6): `README_FA.md` (Persian: install, config, demo, 5-min smoke test, 24-h
   run, VPS + systemd unit file in `deploy/wallex-agent.service`, emergency stop, known limitations &
   every untested/unverified API item), `docs/ARCHITECTURE_FA.md`, `docs/API_UNCERTAINTIES_FA.md`.
