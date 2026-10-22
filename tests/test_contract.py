@@ -71,3 +71,22 @@ def test_config_defaults_and_profile(tmp_path):
         load_config(env={"TRADING_MODE": "live"}, dotenv_path=None)  # no key
     assert "SECRET" not in str(load_config(env={"WALLEX_API_KEY": "SECRET"}, dotenv_path=None))
     assert load_config(env={"WALLEX_API_KEY": "SECRET"}, dotenv_path=None).redacted()["api_key"] == "***set***"
+
+
+@pytest.mark.parametrize("name,bad,good", [
+    ("MAX_SLIPPAGE_BPS", "201", "200"), ("MAX_SLIPPAGE_BPS", "-1", "0"),
+    ("MAX_SPREAD_BPS", "501", "500"), ("MAX_SPREAD_BPS", "0", "1"),
+    ("STOP_LOSS_PCT", "0.6", "0.5"), ("MIN_NET_EDGE_BPS", "10001", "10000"),
+    ("MAX_ROUND_TRIPS", "101", "100"), ("LOOP_INTERVAL_S", "3601", "3600"),
+    ("ORDER_TIMEOUT_S", "0", "1"), ("MAX_DRAWDOWN_PCT", "1", "0.99"),
+])
+def test_risk_knobs_are_bounded(name, bad, good):
+    """L4: an absurd value from the environment would switch a gate off; it is refused instead."""
+    with pytest.raises(ConfigError):
+        load_config(env={name: bad}, dotenv_path=None)
+    load_config(env={name: good}, dotenv_path=None)
+
+
+def test_both_profiles_pass_the_bounds():
+    for profile in ("conservative", "competition"):
+        load_config(env={"PROFILE": profile}, dotenv_path=None)

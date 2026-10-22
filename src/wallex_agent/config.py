@@ -12,6 +12,15 @@ from .types import Mode, dec
 
 FINAL_POLICIES = ("report_only", "flatten_to_usdt", "flatten_to_tmn")
 
+# Upper bounds checked by ``Config.validate`` (values beyond them would effectively switch a gate off).
+MAX_SLIPPAGE_BPS = Decimal("200")
+MAX_SPREAD_BPS = Decimal("500")
+MAX_STOP_LOSS_PCT = Decimal("0.5")
+MAX_NET_EDGE_BPS = Decimal("10000")
+MAX_ROUND_TRIPS = 100
+MAX_BOOK_AGE_S = 120.0
+MAX_LOOP_S = 3600.0
+
 # `competition` is a deliberate, explicit opt-in to more risk. It does NOT promise returns.
 PROFILES: dict[str, dict[str, Any]] = {
     "conservative": {},
@@ -27,12 +36,22 @@ PROFILES: dict[str, dict[str, Any]] = {
 }
 
 
+def absolute_dir(path: str | Path) -> str:
+    """``path`` as an absolute, normalised path; a relative path is resolved against the CURRENT
+    working directory (so the result is fixed at load time and printed in full everywhere)."""
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
 @dataclass(frozen=True)
 class Config:
     # ---- run identity
     mode: Mode = Mode.PAPER
     profile: str = "conservative"
     data_dir: str = "state"
+    # False only when ``load_config`` fell back to the built-in default ``state`` (relative to the
+    # working directory): live trading refuses that, because a different working directory would
+    # silently mean a different ledger, KILL file and evidence.
+    data_dir_explicit: bool = True
     api_base: str = "https://api.wallex.ir"
     api_key: str = field(default="", repr=False)   # secret: never logged / reported
     enable_live: bool = False
@@ -98,15 +117,31 @@ class Config:
         need(self.initial_tmn > 0, "initial_tmn must be > 0")
         need(0 < self.competition_hours <= 168, "competition_hours out of range")
         need(Decimal("0") < self.max_exposure_fraction <= Decimal("1"), "max_exposure_fraction in (0,1]")
-        need(Decimal("0") < self.stop_loss_pct < Decimal("1"), "stop_loss_pct in (0,1)")
+        need(Decimal("0") < self.stop_loss_pct <= MAX_STOP_LOSS_PCT, f"stop_loss_pct in (0,{MAX_STOP_LOSS_PCT}]")
         need(Decimal("0") < self.max_drawdown_pct < Decimal("1"), "max_drawdown_pct in (0,1)")
-        need(self.max_round_trips >= 1, "max_round_trips >= 1")
-        need(self.min_net_edge_bps >= 0, "min_net_edge_bps >= 0")
+        need(1 <= self.max_round_trips <= MAX_ROUND_TRIPS, f"max_round_trips in [1,{MAX_ROUND_TRIPS}]")
+        need(Decimal("0") <= self.min_net_edge_bps <= MAX_NET_EDGE_BPS, f"min_net_edge_bps in [0,{MAX_NET_EDGE_BPS}]")
         need(0.0 <= self.min_confidence <= 1.0, "min_confidence in [0,1]")
-        need(self.loop_interval_s >= 1, "loop_interval_s >= 1")
-        need(self.order_timeout_s >= 1, "order_timeout_s >= 1")
+        # Hard upper bounds on the risk knobs an .env typo could otherwise blow open (L4): these caps
+        # are what the slippage/spread gates enforce, so an absurd value would disable the gate.
+        need(Decimal("0") <= self.max_slippage_bps <= MAX_SLIPPAGE_BPS,
+             f"max_slippage_bps in [0,{MAX_SLIPPAGE_BPS}]")
+        need(Decimal("0") <= self.conversion_slippage_bps <= MAX_SLIPPAGE_BPS,
+             f"conversion_slippage_bps in [0,{MAX_SLIPPAGE_BPS}]")
+        need(Decimal("0") < self.max_spread_bps <= MAX_SPREAD_BPS, f"max_spread_bps in (0,{MAX_SPREAD_BPS}]")
+        need(0 < self.max_book_age_s <= MAX_BOOK_AGE_S, f"max_book_age_s in (0,{MAX_BOOK_AGE_S:g}]")
+        need(self.min_book_depth_quote_usdt >= 0, "min_book_depth_quote_usdt >= 0")
+        need(Decimal("0") <= self.fee_safety_margin < Decimal("0.05"), "fee_safety_margin in [0,0.05)")
+        need(self.cooldown_after_loss_s >= 0 and self.min_trade_interval_s >= 0, "cooldowns >= 0")
+        need(1 <= self.loop_interval_s <= MAX_LOOP_S, f"loop_interval_s in [1,{MAX_LOOP_S:g}]")
+        need(1 <= self.order_timeout_s <= MAX_LOOP_S, f"order_timeout_s in [1,{MAX_LOOP_S:g}]")
+        need(5 <= self.unknown_resolve_window_s <= 600, "unknown_resolve_window_s in [5,600]")
+        need(1 <= self.max_orders_per_intent <= 5, "max_orders_per_intent in [1,5]")
+        need(0 < self.http_timeout_s <= 60, "http_timeout_s in (0,60]")
         need(0 <= self.paper_fee_rate < Decimal("0.05"), "paper_fee_rate in [0,0.05)")
-        need(self.max_requests_per_s > 0 and self.order_requests_per_s > 0, "rate limits > 0")
+        need(0 < self.max_requests_per_s <= 20 and 0 < self.order_requests_per_s <= 5,
+             "rate limits: max_requests_per_s in (0,20], order_requests_per_s in (0,5]")
+        need(bool(str(self.data_dir).strip()), "data_dir must not be empty")
         if self.mode is Mode.LIVE:
             need(bool(self.api_key), "live mode needs WALLEX_API_KEY in the environment/.env")
         return self
@@ -168,7 +203,11 @@ def parse_dotenv(text: str) -> dict[str, str]:
 
 def load_config(env: Mapping[str, str] | None = None, dotenv_path: str | Path | None = ".env",
                 overrides: Mapping[str, Any] | None = None) -> Config:
-    """Precedence: overrides > real environment > .env file > profile > defaults."""
+    """Precedence: overrides > real environment > .env file > profile > defaults.
+
+    ``data_dir`` always comes back ABSOLUTE (a relative value is resolved against the current
+    working directory now, once); ``data_dir_explicit`` records whether it was given at all
+    (``DATA_DIR`` in the environment/.env or an override such as ``--data-dir``)."""
     merged: dict[str, str] = {}
     if dotenv_path and Path(dotenv_path).is_file():
         merged.update(parse_dotenv(Path(dotenv_path).read_text(encoding="utf-8")))
@@ -191,4 +230,6 @@ def load_config(env: Mapping[str, str] | None = None, dotenv_path: str | Path | 
     cfg = replace(base, **parsed)                       # ... then explicit env values win
     if overrides:
         cfg = replace(cfg, **dict(overrides))
+    explicit = "data_dir" in parsed or bool(overrides and str(overrides.get("data_dir") or "").strip())
+    cfg = replace(cfg, data_dir=absolute_dir(cfg.data_dir), data_dir_explicit=explicit)
     return cfg.validate()

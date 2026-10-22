@@ -187,15 +187,115 @@ def test_arm_live_writes_the_arming_file_when_all_gates_pass(capsys, tmp_path, m
 
 # --------------------------------------------------------------------------- kill
 def test_kill_writes_the_kill_file_and_blocks_runs(capsys, tmp_path):
-    code, out, _ = run_cli(capsys, ["kill", "--reason", "test"], tmp_path)
-    assert code == EXIT_OK and (tmp_path / "state" / "KILL").is_file()
+    # nothing under DATA_DIR yet: refused, nothing written (it would probably miss the agent)
+    code, out, err = run_cli(capsys, ["kill", "--reason", "test"], tmp_path)
+    assert code == EXIT_REFUSED and not (tmp_path / "state" / "KILL").exists()
+    assert str(tmp_path / "state") in err and "systemctl stop wallex-agent" in err
+    code, out, err = run_cli(capsys, ["kill", "--reason", "test", "--force-write"], tmp_path)
+    kill = tmp_path / "state" / "KILL"
+    assert code == EXIT_OK and kill.is_file() and f"KILL file written: {kill}" in out
+    assert "demo/backtest runs do NOT read" in out and "unstop" in out and "WARNING" in err
     code, out, _ = run_cli(capsys, ["paper", "--seconds", "30"], tmp_path, transport=recording_public_transport(),
                            clock=SimClock(1_700_000_000.0))
     assert code == EXIT_KILLED and "killed" in out
     code, out, _ = run_cli(capsys, ["kill", "--cancel-open", "--mode", "live"], tmp_path)
-    assert code == EXIT_OK and "never placed a live order" in out
+    assert code == EXIT_OK and "no live store" in out          # a paper run exists now: no refusal
     code, out, _ = run_cli(capsys, ["status"], tmp_path)
     assert json.loads(out)["kill_file_present"] is True
+
+
+def test_kill_from_another_working_directory_does_not_pretend(capsys, tmp_path, monkeypatch):
+    """M3 / R2: the operator's shell lacks the agent's DATA_DIR: kill must not silently write a KILL
+    file the agent never reads, and every path it prints is absolute."""
+    agent_state = tmp_path / "var-lib" / "state"
+    from wallex_agent.store import SqliteStore
+    SqliteStore(agent_state / "live" / "state.db").close()         # the agent's real store
+    operator_cwd = tmp_path / "home-operator"
+    operator_cwd.mkdir()
+    monkeypatch.chdir(operator_cwd)
+    shell = {"OPERATOR_SHELL": "1"}                    # no DATA_DIR, no TRADING_MODE, no key
+    code, out, err = run_cli(capsys, ["kill", "--cancel-open", "--reason", "emergency"], tmp_path, env=shell)
+    assert code == EXIT_REFUSED and not list(tmp_path.rglob("KILL"))
+    assert str(operator_cwd / "state") in err
+    code, out, err = run_cli(capsys, ["--data-dir", str(agent_state), "kill", "--reason", "emergency"],
+                             tmp_path, env=shell)
+    assert code == EXIT_OK and (agent_state / "KILL").is_file() and str(agent_state / "KILL") in out
+    assert json.loads(out[out.index("{"): out.index("}") + 1])["live_store_exists"] is True
+
+
+def test_config_data_dir_is_absolute_and_explicitness_is_recorded(tmp_path, monkeypatch):
+    from wallex_agent.config import load_config
+    monkeypatch.chdir(tmp_path)
+    c = load_config(env={}, dotenv_path=None)
+    assert c.data_dir == str(tmp_path / "state") and c.data_dir_explicit is False
+    c = load_config(env={"DATA_DIR": "rel/dir"}, dotenv_path=None)
+    assert c.data_dir == str(tmp_path / "rel" / "dir") and c.data_dir_explicit is True
+    c = load_config(env={}, dotenv_path=None, overrides={"data_dir": "x"})
+    assert c.data_dir == str(tmp_path / "x") and c.data_dir_explicit is True
+
+
+def test_live_refuses_the_working_directory_default_data_dir(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for argv in (["live", "--i-understand-real-money"], ["arm-live", "--i-understand-real-money"],
+                 ["canary", "--i-understand-real-money"]):
+        code, out, err = run_cli(capsys, argv, tmp_path, env={"WALLEX_API_KEY": SENTINEL, "ENABLE_LIVE": "true"})
+        assert code == EXIT_GATE and "data_dir_explicit" in err and SENTINEL not in out + err
+
+
+def _cancel_responder(order_id: str, symbol: str = "USDTTMN"):
+    """Fake keyed Wallex for one resting order of ours: GET shows it, DELETE cancels it."""
+    from tests._runner_support import public_responder
+    pub = public_responder()
+    state = {"active": True, "deletes": 0}
+
+    def order_doc():
+        return {"symbol": symbol, "type": "LIMIT", "side": "BUY", "price": "135000", "origQty": "0.38",
+                "origSum": "51300", "executedQty": "0", "executedSum": "0", "executedPercent": 0,
+                "status": "NEW" if state["active"] else "CANCELED", "active": state["active"],
+                "clientOrderId": order_id, "created_at": "2026-10-22T10:00:00Z"}
+
+    def respond(method, url, headers, body):
+        from urllib.parse import urlsplit
+        path = urlsplit(url).path
+        if method == "GET" and path == f"/v1/account/orders/{order_id}":
+            return 200, {}, json.dumps({"success": True, "message": "ok", "result": order_doc()}).encode()
+        if method == "DELETE" and path == "/v1/account/orders":
+            state["active"] = False
+            state["deletes"] += 1
+            return 200, {}, b""
+        return pub(method, url, headers, body)
+    return respond, state
+
+
+def test_kill_cancel_open_acts_on_live_whenever_the_live_store_exists(capsys, tmp_path):
+    """M3: --cancel-open reaches the LIVE store even though TRADING_MODE says paper."""
+    from decimal import Decimal as D
+    from wallex_agent.modes import RecordingTransport
+    from wallex_agent.store import OrderRecord, SqliteStore
+    from wallex_agent.types import OrderLifecycle, Side
+    sd = tmp_path / "state"
+    s = SqliteStore(sd / "live" / "state.db")
+    s.insert_order_intent(OrderRecord(client_id="wa-live-1-abc", symbol="USDTTMN", side=Side.BUY,
+                                      price=D("135000"), quantity=D("0.38"), purpose="canary"))
+    s.update_order("wa-live-1-abc", lifecycle=OrderLifecycle.SENDING)
+    s.update_order("wa-live-1-abc", lifecycle=OrderLifecycle.OPEN, exchange_client_order_id="wa-live-1-abc")
+    s.close()
+    env = env_for(tmp_path, TRADING_MODE="paper")
+    responder, state = _cancel_responder("wa-live-1-abc")
+    code, out, err = run_cli(capsys, ["kill", "--cancel-open", "--reason", "x"], tmp_path, env=env,
+                             transport=RecordingTransport(responder=responder), clock=SimClock(1_800_000_000.0))
+    assert code == EXIT_OK, err
+    assert state["deletes"] == 1 and '"cancelled": [' in out and "wa-live-1-abc" in out
+    from wallex_agent.modes import open_snapshot
+    snap = open_snapshot(sd / "live" / "state.db")
+    try:
+        assert snap.get_order("wa-live-1-abc").lifecycle is OrderLifecycle.CANCELED
+        assert snap.kv_get("bot_state")["state"] == "STOPPED"
+    finally:
+        snap.close()
+    # without the key the live cancel path refuses loudly instead of pretending
+    code, out, err = run_cli(capsys, ["kill", "--cancel-open"], tmp_path, env={"DATA_DIR": str(sd)})
+    assert code == EXIT_REFUSED and "WALLEX_API_KEY" in err
 
 
 # --------------------------------------------------------------------------- secrets

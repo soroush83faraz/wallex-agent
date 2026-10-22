@@ -29,7 +29,7 @@ from .reporting import Scrubber, build_final_report, render_trace, verify_chain,
 from .runner import (EXIT_ERROR, EXIT_GATE, EXIT_INTERRUPTED, EXIT_KILLED, EXIT_OK, EXIT_REFUSED,
                      EXIT_STOPPED, EXIT_UNAVAILABLE, EXIT_USAGE, K_BOOKS, K_FEES, K_LABELS, K_START, AgentRunner,
                      RunResult, books_from_kv, fees_from_kv)
-from .store import InstanceLock, InstanceLockError
+from .store import InstanceLockError, probe_lock
 from .types import BPS, ONE, Mode, Side, plain
 
 EXIT_CODES_HELP = f"""exit codes:
@@ -497,33 +497,65 @@ def cmd_status(ctx: Ctx) -> int:
     return EXIT_OK
 
 
+def agent_footprint(cfg: Config) -> dict[str, Any]:
+    """Which KILL-obeying agent state (live store, paper runs) exists under ``cfg.data_dir``, and
+    whether an agent holds its instance lock right now. Creates nothing."""
+    from .modes import live_store_path, runs_dir
+    live_db = live_store_path(cfg)
+    live_lock = probe_lock(live_db.parent)
+    paper_runs = sorted(p for p in runs_dir(cfg, Mode.PAPER).glob("*") if (p / "state.db").is_file()) \
+        if runs_dir(cfg, Mode.PAPER).is_dir() else []
+    paper_running = [p.name for p in paper_runs if probe_lock(p) is True]
+    return {"data_dir": str(cfg.state_path), "live_store": str(live_db), "live_store_exists": live_db.is_file(),
+            "live_agent_running": live_lock is True, "live_lock_file": live_lock is not None,
+            "paper_runs": len(paper_runs), "paper_running": paper_running,
+            "any": live_db.is_file() or live_lock is not None or bool(paper_runs)}
+
+
 def cmd_kill(ctx: Ctx) -> int:
     cfg = ctx.config
     a = ctx.args
+    kill_path = Path(cfg.kill_file).absolute()
+    fp = agent_footprint(cfg)
+    if not fp["any"] and not a.force_write:
+        err(f"!!! kill: NO wallex-agent live store, paper run or instance lock under {cfg.state_path}.\n"
+            f"!!! A KILL file at {kill_path} would most likely NOT be seen by your agent, so it was NOT written.\n"
+            "    The agent reads <its DATA_DIR>/KILL. Re-run with the agent's own settings, e.g.\n"
+            "    `wallex-agent --env-file <the agent's env file> kill` or `wallex-agent --data-dir <dir> kill`.\n"
+            "    On a VPS the emergency stop is `sudo systemctl stop wallex-agent` (then `kill` with the\n"
+            "    service's env file). Use --force-write to write the KILL file here anyway (e.g. to block a\n"
+            "    future start from this DATA_DIR).")
+        return EXIT_REFUSED
     cfg.state_path.mkdir(parents=True, exist_ok=True)
-    live_gate.atomic_write_json(cfg.kill_file, {"reason": a.reason, "at": _iso(time.time())})
-    out(f"KILL file written: {cfg.kill_file}. Every mode refuses new orders while it exists; a running agent "
-        "cancels its open orders (cancel only, never sells) and stops at its next check. "
-        "Delete the file to allow trading again.")
+    live_gate.atomic_write_json(kill_path, {"reason": a.reason, "at": _iso(time.time())})
+    out(f"KILL file written: {kill_path}")
+    if not fp["any"]:
+        err(f"WARNING: no agent state was found under {cfg.state_path} (written anyway: --force-write).")
+    out(_json({k: fp[k] for k in ("data_dir", "live_store_exists", "live_agent_running", "paper_runs",
+                                  "paper_running")}))
+    out("Paper and live agents obey KILL: a running agent cancels its own open orders (cancel only, never "
+        "sells) and stops at its next check, and no new paper/live run, canary or arm-live starts while the file "
+        "exists. demo/backtest runs do NOT read this file.\n"
+        "To trade again: delete the KILL file; if a LIVE agent already acted on it (its ledger is now STOPPED), "
+        "check the account and then run `wallex-agent unstop --i-understand-real-money`.")
     if not a.cancel_open:
-        return EXIT_OK
-    if ctx.mode() is not Mode.LIVE:
-        out(f"--cancel-open: {ctx.mode().value} orders are simulated in-process; the running agent cancels them.")
         return EXIT_OK
     from .modes import live_store_path
     from .modes.live import build_cancel_only_runtime
-    lock = InstanceLock(live_store_path(cfg).parent)
-    try:
-        lock.acquire()
-    except InstanceLockError:
-        out("--cancel-open: a live agent is running; it cancels its own open orders at its next kill check.")
+    live_db = live_store_path(cfg)
+    if not live_db.is_file():
+        out(f"--cancel-open: no live store at {live_db}: no real order of this bot can be open there "
+            "(paper orders are simulated in-process; a running paper agent cancels its own).")
         return EXIT_OK
-    lock.release()
-    if not live_store_path(cfg).is_file():
-        out("--cancel-open: no live store: this bot never placed a live order.")
+    if probe_lock(live_db.parent):
+        out("--cancel-open: a LIVE agent is running on this store; it cancels its own open orders at its next "
+            "kill check (within about a second while it waits between cycles).")
         return EXIT_OK
     try:
         rt = build_cancel_only_runtime(cfg, transport=ctx.transport, clock=ctx.clock)
+    except InstanceLockError:
+        out("--cancel-open: a LIVE agent started meanwhile; it cancels its own open orders at its next kill check.")
+        return EXIT_OK
     except (LiveNotAllowedError, ConfigError) as exc:
         err(f"--cancel-open: {exc}")
         return EXIT_REFUSED
@@ -532,7 +564,7 @@ def cmd_kill(ctx: Ctx) -> int:
     finally:
         rt.close()
     out(_json({"cancelled": res["cancelled"], "still_open": res["still_open"], "unresolved": res["unresolved"]}))
-    out("Only THIS bot's recorded orders were touched; nothing was sold.")
+    out("Only THIS bot's recorded LIVE orders were touched; nothing was sold. The live ledger is now STOPPED.")
     return EXIT_OK if not res["still_open"] else EXIT_STOPPED
 
 
@@ -682,13 +714,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--run", help="run id (default: the mode's last run)")
     s.set_defaults(func=cmd_status)
 
-    s = add("kill", "engage the kill switch (KILL file); --cancel-open also cancels THIS bot's open orders",
-            "Writes <state>/KILL: every mode refuses new orders and a running agent cancels its open orders "
-            "(cancel only, never sells) and stops. --cancel-open (live, agent not running) cancels the "
-            "open orders recorded in THIS bot's store; it never touches other orders and never sells.")
-    s.add_argument("--cancel-open", action="store_true", help="also cancel this bot's recorded open orders")
+    s = add("kill", "engage the kill switch (<DATA_DIR>/KILL); --cancel-open also cancels THIS bot's live orders",
+            "Writes <DATA_DIR>/KILL (the absolute path is printed). PAPER and LIVE agents obey it: a running "
+            "agent cancels its open orders (cancel only, never sells) and stops; demo/backtest runs do NOT read "
+            "it. Refuses (exit 6, nothing written) when no live store, paper run or instance lock exists under "
+            "DATA_DIR, because the agent then almost certainly uses another DATA_DIR: pass the agent's "
+            "--env-file/--data-dir, or --force-write. On a VPS the emergency stop is `systemctl stop "
+            "wallex-agent`. --cancel-open: whenever <DATA_DIR>/live/state.db exists and no live agent is "
+            "running, cancels the open orders recorded in THIS bot's live store (never other orders, never "
+            "sells) and leaves that ledger STOPPED. To trade again: delete KILL, then `unstop`.")
+    s.add_argument("--cancel-open", action="store_true", help="also cancel this bot's recorded live open orders")
     s.add_argument("--reason", default="operator kill", help="free text stored in the KILL file")
-    s.add_argument("--mode", choices=[m.value for m in Mode], help="mode for --cancel-open (default: TRADING_MODE)")
+    s.add_argument("--force-write", action="store_true",
+                   help="write KILL even though no agent state exists under DATA_DIR")
+    s.add_argument("--mode", choices=[m.value for m in Mode],
+                   help="ignored (kept for old scripts): --cancel-open acts on the live store whenever it exists")
     s.set_defaults(func=cmd_kill)
 
     s = add("report", "rebuild final_report.json from the store (offline)")

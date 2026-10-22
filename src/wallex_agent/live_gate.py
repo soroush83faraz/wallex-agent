@@ -410,6 +410,12 @@ def _evaluate(config: Config, state_dir: Path, now: float, *,
         _cond("api_key_set", bool(config.api_key and config.api_key.strip()),
               "WALLEX_API_KEY is " + ("set" if config.api_key and config.api_key.strip() else "empty")),
     ]
+    explicit = bool(getattr(config, "data_dir_explicit", True)) and Path(config.data_dir).is_absolute()
+    conds.append(_cond("data_dir_explicit", explicit,
+                       f"DATA_DIR is {config.data_dir}" if explicit else
+                       f"DATA_DIR not set explicitly (would be {Path(config.data_dir).absolute()}): set DATA_DIR "
+                       "in the environment/.env or pass --data-dir; live never runs on the working-directory "
+                       "default, because another working directory would mean another ledger and KILL file"))
     kill_paths = {state_dir / KILL_FILE, config.kill_file}
     killed = sorted(str(p) for p in kill_paths if p.exists())
     conds.append(_cond("no_kill_file", not killed,

@@ -122,10 +122,13 @@ def _break(case, cfg, sdir):
         edit_json(at, source_hash="f" * 64)
     elif case == "typed_phrase":
         kw["typed_phrase"] = "START LIVE 50000000"
+    elif case == "data_dir_explicit":
+        cfg = replace(cfg, data_dir_explicit=False)
     return cfg, kw
 
 
-CASES = ["mode_live", "enable_live", "flag_ack", "api_key_set", "no_kill_file", "selftest_present",
+CASES = ["mode_live", "enable_live", "flag_ack", "api_key_set", "data_dir_explicit", "no_kill_file",
+         "selftest_present",
          "selftest_passed", "selftest_fresh", "selftest_source_hash", "schema_attestation_present",
          "schema_attestation_ok", "schema_attestation_fresh", "schema_attestation_base_url",
          "schema_attestation_source_hash", "typed_phrase"]
