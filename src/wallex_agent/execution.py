@@ -1105,6 +1105,31 @@ class ExecutionEngine:
         self._audit("cancel_open_orders", out)
         return out
 
+    def settle_for_shutdown(self, reason: str) -> dict[str, Any]:
+        """Before the process exits (signal, safety stop, end of session): every SENDING /
+        UNKNOWN_OUTCOME order gets ONE lookup that can only ADOPT it (never re-send, never abandon in
+        a hurry), then every OPEN/PARTIAL order is cancelled and verified (cancel only, never sells).
+        Orders still unknown afterwards stay blocking and are resolved by the next startup."""
+        adopted: list[str] = []
+        for rec in self.store.unresolved_orders():
+            if rec.lifecycle is L.INTENT:
+                self._resolve_one(rec)
+            elif rec.lifecycle in (L.SENDING, L.UNKNOWN_OUTCOME):
+                try:
+                    if self.resolve_unknown(rec, adopt_only=True) == "adopted":
+                        adopted.append(rec.client_id)
+                except Exception as exc:  # noqa: BLE001 - shutdown must go on
+                    self._audit("read_failed", {"client_id": rec.client_id, "op": "shutdown_lookup",
+                                                "error": type(exc).__name__})
+        out = self.cancel_open_orders(reason)
+        out["adopted"] = adopted
+        out["still_unknown"] = [o.client_id for o in self.store.unresolved_orders()
+                                if o.lifecycle in (L.SENDING, L.UNKNOWN_OUTCOME)]
+        if out["still_unknown"]:
+            self._alert("unknown_at_shutdown", {"client_ids": out["still_unknown"],
+                                                "note": "resolved from exchange facts at the next start"})
+        return out
+
     def poll_and_manage(self, *, check_balances: bool = True) -> dict[str, Any]:
         """Refresh every unresolved order from the exchange, record fills, cancel timed-out orders
         (and verify), re-check every watched ABANDONED order (and count quarantine re-checks), settle

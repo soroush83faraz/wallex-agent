@@ -225,6 +225,60 @@ def test_stage_convert_blocks_non_conversion_intents(tmp_path):
     assert w.sim.order_count() == 0
 
 
+def _crash_after_post(w, rt, stage="after_post"):
+    from wallex_agent.execution import SimulatedCrash
+    from wallex_agent.types import TradeIntent
+    rt.engine.convert_tmn_to_usdt()
+    rt.engine.crash_at = {stage}
+    book = w.source.get_book(BTC)
+    with pytest.raises(SimulatedCrash):
+        rt.engine.submit(TradeIntent("entry", Side.BUY, BTC, D("0.00005"), book.best_ask, D("20"),
+                                     style="passive_limit"))
+    rt.engine.crash_at = set()
+    rec = rt.store.list_orders()[-1]
+    assert rec.lifecycle is OrderLifecycle.SENDING          # POSTed, outcome never recorded
+    return rec.client_id
+
+
+def test_shutdown_resolves_an_unknown_order_and_cancels_it(tmp_path):
+    """I7: finish() adopts SENDING/UNKNOWN_OUTCOME orders with one lookup, then cancels (cancel only)."""
+    w = sim_world(tmp_path, order_timeout_s=10_000)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    assert r.start() is None
+    cid = _crash_after_post(w, rt)
+    res = r.finish("interrupted")
+    assert rt.store.get_order(cid).lifecycle is OrderLifecycle.CANCELED
+    assert not any(o.active for o in w.sim.all_orders())
+    assert not [o for o in w.sim.all_orders() if o.side is Side.SELL]
+    assert res.status == "interrupted" and rt.sm.state is BotState.READY
+
+
+def test_safety_stop_also_resolves_unknown_orders(tmp_path):
+    w = sim_world(tmp_path, order_timeout_s=10_000)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    assert r.start() is None
+    cid = _crash_after_post(w, rt)
+    r._safety_stop("test")
+    assert rt.store.get_order(cid).lifecycle is OrderLifecycle.CANCELED and rt.sm.state is BotState.STOPPED
+    assert not any(o.active for o in w.sim.all_orders())
+
+
+def test_shutdown_leaves_an_unfindable_order_unknown_for_the_next_start(tmp_path):
+    w = sim_world(tmp_path)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    assert r.start() is None
+    cid = _crash_after_post(w, rt, stage="after_sending")    # persisted SENDING, never reached the exchange
+    posts = sum(w.sim.post_counts.values())
+    out = rt.engine.settle_for_shutdown("test")
+    assert sum(w.sim.post_counts.values()) == posts            # one lookup, never a re-send
+    assert out["still_unknown"] == [cid] and rt.store.get_order(cid).lifecycle is OrderLifecycle.UNKNOWN_OUTCOME
+    assert any(x["kind"] == "alert" and x["payload"].get("alert") == "unknown_at_shutdown"
+               for x in read_audit(rt.audit.path))
+
+
 # --------------------------------------------------------------------------- forced exits / late fills
 def test_hard_stop_loss_forces_an_exit_through_risk_and_engine(tmp_path):
     w = sim_world(tmp_path, min_trade_interval_s=60.0)

@@ -130,6 +130,69 @@ def test_refusals_send_nothing(tmp_path, case):
     assert sum(sim.post_counts.values()) == posts
 
 
+def test_interrupt_before_sending_sends_nothing(tmp_path):
+    """I5: SIGINT/SIGTERM before the POST => refused, nothing sent."""
+    rt, sim, _ = live_like_runtime(tmp_path)
+    with pytest.raises(CanaryRefused, match="interrupted"):
+        run_canary(rt, should_stop=lambda: "SIGINT")
+    assert sum(sim.post_counts.values()) == 0
+
+
+def test_interrupt_after_placement_cancels_the_resting_order_at_once(tmp_path):
+    rt, sim, _ = live_like_runtime(tmp_path)
+    doc = run_canary(rt, should_stop=lambda: "SIGTERM" if sim.order_count() else None)
+    assert doc["ok"] is False and any("interrupted (SIGTERM)" in r for r in doc["reasons"])
+    (info,) = sim.all_orders()
+    assert info.active is False and info.status.value == "CANCELED"
+    assert rt.store.list_orders()[0].lifecycle is OrderLifecycle.CANCELED
+    assert sim.max_posts_per_client_id() == 1
+
+
+def test_an_exception_after_placement_still_cancels_the_canary(tmp_path):
+    """I5: whatever escapes after the order rests, a finally cancels it (cancel only)."""
+    rt, sim, _ = live_like_runtime(tmp_path)
+    real = sim.get_balances
+    calls = {"n": 0}
+
+    def balances_then_interrupt():
+        calls["n"] += 1
+        if sim.order_count():                     # the locked-balance observation after placement
+            raise KeyboardInterrupt
+        return real()
+
+    sim.get_balances = balances_then_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        run_canary(rt)
+    sim.get_balances = real
+    (info,) = sim.all_orders()
+    assert info.active is False and rt.store.list_orders()[0].lifecycle is OrderLifecycle.CANCELED
+
+
+def test_cli_canary_routes_signals_to_the_canary(monkeypatch, tmp_path, capsys):
+    """I5: `canary` installs the flag-only handlers; a signal during the canary is seen by it."""
+    import signal as _signal
+    from wallex_agent import canary as canary_mod
+    from wallex_agent import cli
+    from wallex_agent.modes import live as live_mode
+    rt, sim, _ = live_like_runtime(tmp_path)
+    monkeypatch.setattr(live_mode, "build_canary_runtime", lambda *a, **k: rt)
+    seen = {}
+
+    def fake_run_canary(rt_, *, should_stop=None, now=None):
+        before = should_stop()
+        _signal.getsignal(_signal.SIGINT)(_signal.SIGINT, None)      # what Ctrl+C does
+        seen.update(before=before, after=should_stop())
+        raise CanaryRefused(f"interrupted ({should_stop()}) before sending: nothing was sent")
+
+    monkeypatch.setattr(canary_mod, "run_canary", fake_run_canary)
+    default = _signal.getsignal(_signal.SIGINT)
+    code = cli.main(["--env-file", str(tmp_path / "none.env"), "canary", "--i-understand-real-money"],
+                    env={"DATA_DIR": str(tmp_path), "WALLEX_API_KEY": SENTINEL})
+    assert seen == {"before": None, "after": "SIGINT"} and code == 130
+    assert _signal.getsignal(_signal.SIGINT) is default                   # restored afterwards
+    assert SENTINEL not in capsys.readouterr().err
+
+
 def test_id_pattern_hides_values():
     assert id_pattern("LIMIT-0123456789abcdef") == "LIMIT-<hex16>"
     assert id_pattern("12345678") == "<hex8>"

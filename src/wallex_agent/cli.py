@@ -405,24 +405,30 @@ def cmd_canary(ctx: Ctx) -> int:
     except InstanceLockError as exc:
         err(f"canary: {exc}")
         return EXIT_REFUSED
+    flag = StopFlag()                       # I5: same flag-only handling as the trading loop
+    restore = _install_signals(flag)
     try:
         rep = rt.engine.reconcile_startup()
         if not rep.get("ok"):
             err(f"canary refused: startup reconciliation not ok (state {rep.get('state')}): "
-                f"{rep.get('actions') or (rep.get('drift') or {}).get('reasons')}")
+                f"{rep.get('actions') or (rep.get('drift') or {}).get('text') or (rep.get('drift') or {}).get('reasons')}")
             return EXIT_STOPPED if rt.sm.state.value == "STOPPED" else EXIT_UNAVAILABLE
         try:
-            doc = run_canary(rt)
+            doc = run_canary(rt, should_stop=lambda: flag.reason)
         except CanaryRefused as exc:
             err(f"canary refused (nothing sent): {exc}")
-            return EXIT_REFUSED
+            return EXIT_INTERRUPTED if flag.stop_requested else EXIT_REFUSED
         out(_json({k: doc[k] for k in ("ok", "at", "base_url", "verified", "reasons", "observations")}))
         if rt.extras.get("canary_holdings"):
             err("!!! THE CANARY ORDER FILLED. Holdings now recorded in the live ledger: "
                 + ", ".join(f"{v} {k}" for k, v in sorted(rt.extras["canary_holdings"].items())))
         out(f"written: {cfg.state_path / live_gate.CANARY_FILE}")
+        if flag.stop_requested:
+            err(f"{flag.reason} received: the canary order was cancelled (cancel only); run the canary again.")
+            return EXIT_INTERRUPTED
         return EXIT_OK if doc["ok"] else EXIT_REFUSED
     finally:
+        restore()
         rt.close()
 
 

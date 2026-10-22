@@ -304,9 +304,9 @@ class AgentRunner:
             return "unknown"
 
     def _safety_stop(self, reason: str) -> None:
-        """Cancel our open orders (cancel only, never sell) and go STOPPED."""
+        """Adopt-or-leave unknown orders, cancel our open orders (cancel only, never sell), STOPPED."""
         try:
-            self.engine.cancel_open_orders(f"safety stop: {reason}")
+            self.engine.settle_for_shutdown(f"safety stop: {reason}")
         except Exception as exc:  # noqa: BLE001
             self._safe_audit("alert", {"alert": "cancel_failed", "error": type(exc).__name__})
         try:
@@ -709,9 +709,9 @@ class AgentRunner:
         self._announce_stop()
         if status in ("interrupted", "stopped", "session_end", "max_cycles"):
             try:
-                if any(o.lifecycle.value in ("OPEN", "PARTIAL") for o in self.store.unresolved_orders()):
-                    out = self.engine.cancel_open_orders(f"shutdown: {status}")
-                    self.audit("tool_call", {"name": "engine.cancel_open_orders", "reason": status, "result": out})
+                if self.store.unresolved_orders():     # incl. SENDING / UNKNOWN_OUTCOME: adopt, then cancel
+                    out = self.engine.settle_for_shutdown(f"shutdown: {status}")
+                    self.audit("tool_call", {"name": "engine.settle_for_shutdown", "reason": status, "result": out})
             except Exception as exc:  # noqa: BLE001
                 self._safe_audit("alert", {"alert": "cancel_on_shutdown_failed", "error": type(exc).__name__})
         self._flush_store_events_safe()
