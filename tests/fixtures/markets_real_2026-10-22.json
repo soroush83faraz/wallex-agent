@@ -1,0 +1,84 @@
+{
+ "success": true,
+ "message": "captured",
+ "result": {
+  "symbols": {
+   "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "baseAsset": "BTC",
+    "baseAssetPrecision": 8,
+    "quoteAsset": "USDT",
+    "quotePrecision": 8,
+    "stepSize": 8,
+    "tickSize": 2,
+    "minQty": 1e-08,
+    "minNotional": 1,
+    "stats": {
+     "bidPrice": "81200.0100000000000000",
+     "askPrice": "81295.4800000000000000",
+     "lastPrice": "81200.0100000000000000",
+     "lastQty": "81200.0100000000000000",
+     "lastTradeSide": "BUY",
+     "bidVolume": "0.40356475",
+     "askVolume": "1.11164675",
+     "bidCount": 50,
+     "askCount": 50,
+     "direction": {
+      "SELL": 67,
+      "BUY": 33
+     },
+     "24h_ch": -3.78,
+     "7d_ch": -0.97,
+     "24h_volume": "6.2135223800000000",
+     "7d_volume": "31.7592576500000000",
+     "24h_quoteVolume": "512777.1119532674000000",
+     "24h_highPrice": "84793.5800000000000000",
+     "24h_lowPrice": "81011.9100000000000000",
+     "24h_tmnVolume": "139544086584.29047063160000000000000000000000"
+    },
+    "createdAt": "2020-04-01T00:00:00Z",
+    "isNew": false,
+    "isZeroFee": false,
+    "isMarketTypeEnable": true
+   },
+   "USDTTMN": {
+    "symbol": "USDTTMN",
+    "baseAsset": "USDT",
+    "baseAssetPrecision": 8,
+    "quoteAsset": "TMN",
+    "quotePrecision": 0,
+    "stepSize": 2,
+    "tickSize": 0,
+    "minQty": 0.01,
+    "minNotional": 50000,
+    "stats": {
+     "bidPrice": "272135.0000000000000000",
+     "askPrice": "272158.0000000000000000",
+     "lastPrice": "272134.0000000000000000",
+     "lastQty": "272134.0000000000000000",
+     "lastTradeSide": "SELL",
+     "bidVolume": "14537.39",
+     "askVolume": "12454.48",
+     "bidCount": 50,
+     "askCount": 50,
+     "direction": {
+      "SELL": 54,
+      "BUY": 46
+     },
+     "24h_ch": 2.29,
+     "7d_ch": 2.2,
+     "24h_volume": "940642.0936135400000000",
+     "7d_volume": "4517258.7369808000000000",
+     "24h_quoteVolume": "254008051521.4919899100000000",
+     "24h_highPrice": "272500.0000000000000000",
+     "24h_lowPrice": "264425.0000000000000000",
+     "24h_tmnVolume": "254008051521.4919899100000000"
+    },
+    "createdAt": "2020-01-01T00:00:00Z",
+    "isNew": false,
+    "isZeroFee": false,
+    "isMarketTypeEnable": true
+   }
+  }
+ }
+}
