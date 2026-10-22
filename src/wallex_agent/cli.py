@@ -96,6 +96,9 @@ class Ctx:
         return Mode(m) if m else self.default_mode
 
 
+_SIGNAL_NAMES = {int(getattr(signal, n)): n for n in ("SIGINT", "SIGTERM", "SIGBREAK") if hasattr(signal, n)}
+
+
 def out(*parts: Any) -> None:
     print(*parts, flush=True)
 
@@ -116,14 +119,29 @@ def _json(obj: Any) -> str:
 
 
 # --------------------------------------------------------------------------- signals
-def _install_signals(runner: AgentRunner) -> Callable[[], None]:
+class StopFlag:
+    """What a signal handler may touch: one attribute assignment. No I/O, no locks (the main loop
+    may be inside a print or an audit write when the signal arrives)."""
+
+    def __init__(self) -> None:
+        self.reason: str | None = None
+
+    def request_stop(self, reason: str = "signal") -> None:
+        self.reason = reason
+
+    @property
+    def stop_requested(self) -> bool:
+        return self.reason is not None
+
+
+def _install_signals(target: Any) -> Callable[[], None]:
+    """Route SIGINT/SIGTERM/SIGBREAK to ``target.request_stop(name)`` and nothing else; the main
+    loop notices the flag and reports it (``AgentRunner.notify``)."""
     names = ["SIGINT", "SIGTERM", "SIGBREAK"]
     previous: dict[int, Any] = {}
 
     def handler(signum: int, frame: Any) -> None:
-        runner.request_stop(signal.Signals(signum).name)
-        err(f"\n{signal.Signals(signum).name} received: finishing the current step, cancelling resting "
-            "orders (cancel only), writing a partial report...")
+        target.request_stop(_SIGNAL_NAMES.get(signum, "signal"))
 
     for n in names:
         sig = getattr(signal, n, None)
@@ -189,6 +207,7 @@ def print_summary(res: RunResult, rt: Any, title: str) -> None:
 
 
 def _run(rt: Any, runner: AgentRunner, title: str, **run_kw: Any) -> int:
+    runner.notify = err
     restore = _install_signals(runner)
     try:
         res = runner.run(**run_kw)

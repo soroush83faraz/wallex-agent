@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .agent import Observation
 from .errors import KillSwitchActive
@@ -143,6 +143,8 @@ class AgentRunner:
         self.deadline_ts: float | None = None
         self.reason = ""
         self._stop_requested: str | None = None
+        self._stop_announced = False
+        self.notify: Callable[[str], None] | None = None    # main-loop messages (the CLI prints them)
         self._scrub = Scrubber(rt.secrets)
         self._seen_transitions = sum(1 for _ in self.store.iter_events("state_transition"))
         self._seen_fills = self.store.count_fills()
@@ -153,12 +155,24 @@ class AgentRunner:
         self.rt.audit.write(kind, dict(payload))
 
     def request_stop(self, reason: str = "signal") -> None:
-        """Signal handlers call this: the current step finishes, then the runner shuts down cleanly."""
+        """Signal handlers call this and NOTHING else (no I/O there): the current step finishes, then
+        the main loop announces the stop and shuts down cleanly."""
         self._stop_requested = reason
 
     @property
     def stop_requested(self) -> bool:
         return self._stop_requested is not None
+
+    def _announce_stop(self) -> None:
+        if self._stop_announced or not self.stop_requested:
+            return
+        self._stop_announced = True
+        if self.notify is not None:
+            try:
+                self.notify(f"{self._stop_requested} received: finishing the current step, cancelling resting "
+                            "orders (cancel only), writing a partial report...")
+            except Exception:  # noqa: BLE001 - a broken terminal must not block the shutdown
+                pass
 
     def _flush_store_events(self) -> None:
         """Mirror new state transitions and fills from the store into the audit log."""
@@ -218,6 +232,7 @@ class AgentRunner:
         t0 = self.clock.monotonic()
         while status is None:
             if self.stop_requested:
+                self._announce_stop()
                 status = "interrupted"
                 break
             status = self.run_once()
@@ -677,6 +692,7 @@ class AgentRunner:
 
     # ------------------------------------------------------------------ finish / report
     def finish(self, status: str) -> RunResult:
+        self._announce_stop()
         if status in ("interrupted", "stopped", "session_end", "max_cycles"):
             try:
                 if any(o.lifecycle.value in ("OPEN", "PARTIAL") for o in self.store.unresolved_orders()):

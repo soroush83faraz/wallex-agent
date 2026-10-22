@@ -204,7 +204,9 @@ class AuditLog:
             last = self._last_record()
             if last is not None:
                 self.seq, self.last_hash = int(last["seq"]), str(last["hash"])
-        self._fh = open(self.path, "ab")
+        self._fh = open(self.path, "ab", buffering=0)      # raw: no Python-side buffer to tear
+        self._good_size = os.fstat(self._fh.fileno()).st_size
+        self._pending: tuple[int, str, bytes] | None = None
         if dropped is not None:
             self.write("audit_torn_tail_dropped", dropped)
 
@@ -248,7 +250,12 @@ class AuditLog:
         return json.loads(last.decode("utf-8")) if last else None
 
     def write(self, kind: str, payload: Mapping[str, Any] | None) -> None:
+        """Append one record. ``seq``/``last_hash`` advance only AFTER the whole line is in the file
+        (and fsync'd when durable): an exception or interrupt mid-write leaves the in-memory chain at
+        the last good record, and the next write first adopts the line (if it fully landed) or cuts
+        the torn bytes off, so the chain can never fork or carry a half line."""
         with self._lock:
+            self._settle_pending()
             rec: dict[str, Any] = {
                 "seq": self.seq + 1,
                 "ts": _iso(self.clock.now(), ms=True),
@@ -260,16 +267,53 @@ class AuditLog:
             }
             rec["hash"] = record_hash(self.last_hash, rec)
             line = (canonical_json(rec) + "\n").encode("utf-8")
-            self._fh.write(line)
-            self._fh.flush()
+            self._pending = (int(rec["seq"]), str(rec["hash"]), line)
+            self._raw_write(line)
+            self._commit_pending()
+
+    def _raw_write(self, line: bytes) -> None:
+        fd = self._fh.fileno()
+        view = memoryview(line)
+        while view:
+            view = view[os.write(fd, view):]
+        if self.durable:
+            os.fsync(fd)
+
+    def _commit_pending(self) -> None:
+        assert self._pending is not None
+        seq, digest, line = self._pending
+        self.seq, self.last_hash = seq, digest
+        self._good_size += len(line)
+        self._pending = None
+
+    def _settle_pending(self) -> None:
+        if self._pending is None:
+            return
+        _, _, line = self._pending
+        fd = self._fh.fileno()
+        size = os.fstat(fd).st_size
+        landed = False
+        if size == self._good_size + len(line):
+            with open(self.path, "rb") as fh:
+                fh.seek(self._good_size)
+                landed = fh.read(len(line)) == line
+        if landed:
             if self.durable:
-                os.fsync(self._fh.fileno())
-            self.seq, self.last_hash = rec["seq"], rec["hash"]
+                os.fsync(fd)
+            self._commit_pending()          # the interrupted write had completed: keep it
+            return
+        os.ftruncate(fd, self._good_size)   # torn or missing: drop it; the chain continues intact
+        if self.durable:
+            os.fsync(fd)
+        self._pending = None
 
     def close(self) -> None:
         with self._lock:
             if not self._fh.closed:
-                self._fh.close()
+                try:
+                    self._settle_pending()
+                finally:
+                    self._fh.close()
 
     def __enter__(self) -> "AuditLog":
         return self

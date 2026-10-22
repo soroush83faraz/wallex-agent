@@ -300,6 +300,43 @@ def test_kill_cancel_open_acts_on_live_whenever_the_live_store_exists(capsys, tm
     assert code == EXIT_REFUSED and "WALLEX_API_KEY" in err
 
 
+# --------------------------------------------------------------------------- signals
+def test_signal_handler_only_sets_a_flag(monkeypatch):
+    """L5: the handler runs between two bytecodes of the main loop (possibly inside a print or an
+    audit write): it must do no I/O at all, only flag the stop."""
+    import signal as _signal
+
+    class Boom(io.StringIO):
+        def write(self, s):
+            raise AssertionError("I/O from inside the signal handler")
+
+    flag = cli.StopFlag()
+    restore = cli._install_signals(flag)
+    try:
+        handler = _signal.getsignal(_signal.SIGINT)
+        monkeypatch.setattr("sys.stdout", Boom())
+        monkeypatch.setattr("sys.stderr", Boom())
+        handler(_signal.SIGINT, None)
+        assert flag.stop_requested and flag.reason == "SIGINT"
+    finally:
+        restore()
+    assert _signal.getsignal(_signal.SIGINT) is not handler
+
+
+def test_runner_announces_the_stop_from_the_main_loop(tmp_path):
+    from tests._runner_support import hold_script, sim_world
+    from wallex_agent.runner import AgentRunner
+    w = sim_world(tmp_path)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    said = []
+    r.notify = said.append
+    r.request_stop("SIGTERM")                       # what the handler does
+    assert said == []                               # nothing printed by the handler path
+    res = r.run()
+    assert res.status == "interrupted" and len(said) == 1 and said[0].startswith("SIGTERM received")
+
+
 # --------------------------------------------------------------------------- secrets
 def test_scrubbing_stream_removes_the_key():
     buf = io.StringIO()

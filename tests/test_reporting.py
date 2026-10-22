@@ -116,6 +116,72 @@ def test_torn_tail_is_dropped_and_recorded(tmp_path):
     assert verify_chain(p) == (True, None)
 
 
+@pytest.mark.parametrize("durable", [True, False])
+def test_interrupt_mid_write_never_breaks_the_chain(tmp_path, durable):
+    """L5: a signal/KeyboardInterrupt while a line is half written must not fork the chain or leave a
+    half line in the middle of the log; seq/hash only advance once the line is in the file."""
+    p = tmp_path / "audit.jsonl"
+    log = AuditLog(p, run_id="r", clock=SimClock(1_700_000_000.0), durable=durable)
+    log.write("a", {"i": 1})
+    real = log._raw_write
+
+    def half_then_interrupt(line):
+        import os as _os
+        _os.write(log._fh.fileno(), line[: len(line) // 2])
+        raise KeyboardInterrupt
+
+    log._raw_write = half_then_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        log.write("b_torn", {"i": 2})
+    assert log.seq == 1                                    # state NOT advanced
+    log._raw_write = real
+    log.write("c", {"i": 3})
+    log.close()
+    assert verify_chain(p) == (True, None)
+    assert [(r["seq"], r["kind"]) for r in read_audit(p)] == [(1, "a"), (2, "c")]
+
+
+def test_interrupt_after_the_line_landed_keeps_it(tmp_path):
+    p = tmp_path / "audit.jsonl"
+    log = AuditLog(p, run_id="r", clock=SimClock(1_700_000_000.0))
+    log.write("a", {})
+    real = log._raw_write
+
+    def write_then_interrupt(line):
+        real(line)
+        raise KeyboardInterrupt                            # e.g. arrives between fsync and commit
+
+    log._raw_write = write_then_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        log.write("b", {})
+    log._raw_write = real
+    log.write("c", {})
+    log.close()
+    assert verify_chain(p) == (True, None)
+    assert [r["kind"] for r in read_audit(p)] == ["a", "b", "c"]
+
+
+def test_close_after_an_interrupted_write_leaves_a_valid_log(tmp_path):
+    p = tmp_path / "audit.jsonl"
+    log = AuditLog(p, run_id="r", clock=SimClock(1_700_000_000.0))
+    log.write("a", {})
+
+    def boom(line):
+        import os as _os
+        _os.write(log._fh.fileno(), line[:7])
+        raise OSError("disk full")
+
+    log._raw_write = boom
+    with pytest.raises(OSError):
+        log.write("b", {})
+    log.close()
+    assert verify_chain(p) == (True, None) and [r["kind"] for r in read_audit(p)] == ["a"]
+    log2 = AuditLog(p, run_id="r2", clock=SimClock(1_700_000_100.0))
+    log2.write("c", {})
+    log2.close()
+    assert [r["seq"] for r in read_audit(p)] == [1, 2] and verify_chain(p) == (True, None)
+
+
 def test_complete_record_missing_only_newline_is_kept(tmp_path):
     p = tmp_path / "audit.jsonl"
     write_n(p, 3).close()
