@@ -54,6 +54,19 @@ UNVERIFIED: tuple[tuple[str, str], ...] = (
      "value - locked)."),
 )
 
+# The subset of UNVERIFIED that ONE real, non-fillable, cancelled canary order settles (canary.py
+# lists the ids it actually verified in live_canary.json; the attestation and ``arm_status`` then
+# move them out of "unverified"). Partial-fill status and rejection codes stay unverified.
+CANARY_VERIFIABLE: tuple[str, ...] = (
+    "post_order_response_shape", "client_id_echo", "get_order_by_client_id", "terminal_active_flag",
+    "cancel_response", "balance_value_includes_locked")
+
+
+def unverified_after_canary(verified: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """``UNVERIFIED`` minus the items a valid canary verified (unknown ids are ignored)."""
+    done = {v for v in verified if v in CANARY_VERIFIABLE}
+    return tuple((k, v) for k, v in UNVERIFIED if k not in done)
+
 
 class SchemaReport(dict):  # type: ignore[type-arg]
     """JSON-able dict ``{ok, checks: [{name, ok, detail}], undocumented: [...], at, base_url, ...}``

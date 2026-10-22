@@ -42,12 +42,19 @@ def live_config(tmp_path, **kw):
     return replace(Config(mode=Mode.LIVE, enable_live=True, api_key=SENTINEL_KEY, data_dir=str(tmp_path)), **kw)
 
 
+def write_canary(sdir, **kw):
+    doc = {"ok": True, "at": iso(NOW - 600), "base_url": BASE, "observations": {}, "verified": []}
+    doc.update(kw)
+    lg.atomic_write_json(Path(sdir) / lg.CANARY_FILE, doc)
+
+
 @pytest.fixture
 def armed(tmp_path):
     """A state dir with fresh, passing evidence for the current source tree."""
     cfg = live_config(tmp_path)
     lg.run_selftest(tmp_path, runner=ok_runner, clock=SimClock(NOW - 3600))
     lg.write_schema_attestation(tmp_path, probe_report(), BASE)
+    write_canary(tmp_path)
     return cfg
 
 
@@ -129,7 +136,8 @@ def test_each_unmet_condition_alone_blocks(armed, tmp_path, case):
     cfg, kw = _break(case, armed, tmp_path)
     with pytest.raises(LiveNotAllowedError) as ei:
         lg.check_live_allowed(cfg, now=NOW, **kw)
-    assert unmet_names(ei) == {case}
+    # the canary evidence is bound to the base_url too, so a different api_base also unmeets it
+    assert unmet_names(ei) == ({case, "canary_ok"} if case == "schema_attestation_base_url" else {case})
     assert case in str(ei.value)
     assert SENTINEL_KEY not in str(ei.value)
 
@@ -156,9 +164,10 @@ def test_all_unmet_conditions_are_listed_and_no_prompt(tmp_path):
         lg.check_live_allowed(cfg, flag_ack=False, typed_phrase=None, now=NOW,
                               input_fn=lambda p: asked.append(p) or PHRASE)
     assert unmet_names(ei) == {"mode_live", "enable_live", "flag_ack", "api_key_set", "no_kill_file",
-                               "selftest_present", "schema_attestation_present", "typed_phrase"}
+                               "selftest_present", "schema_attestation_present", "canary_ok",
+                               "typed_phrase"}
     assert asked == []     # never ask for the phrase while other gates are unmet
-    assert "8 unmet condition(s)" in str(ei.value)
+    assert "9 unmet condition(s)" in str(ei.value)
 
 
 def test_expired_attestation_and_base_url_mismatch_together(armed, tmp_path):
@@ -166,7 +175,7 @@ def test_expired_attestation_and_base_url_mismatch_together(armed, tmp_path):
     cfg = replace(armed, api_base="https://evil.example.test")
     with pytest.raises(LiveNotAllowedError) as ei:
         lg.check_live_allowed(cfg, flag_ack=True, typed_phrase=PHRASE, now=NOW)
-    assert unmet_names(ei) == {"schema_attestation_fresh", "schema_attestation_base_url"}
+    assert unmet_names(ei) == {"schema_attestation_fresh", "schema_attestation_base_url", "canary_ok"}
 
 
 def test_freshness_boundary_and_future_dates(armed, tmp_path):
@@ -213,6 +222,7 @@ def test_tampered_source_blocks_live(tmp_path, monkeypatch):
     cfg = live_config(sdir)
     lg.run_selftest(sdir, runner=ok_runner, clock=SimClock(NOW - 60))
     lg.write_schema_attestation(sdir, probe_report(), BASE)
+    write_canary(sdir)
     lg.check_live_allowed(cfg, flag_ack=True, typed_phrase=PHRASE, now=NOW)       # untouched: ok
     risk = pkg / "risk.py"
     risk.write_bytes(risk.read_bytes() + b"\n# bypass the hurdle\n")

@@ -7,9 +7,14 @@ dir and are written atomically:
 * ``selftest.json`` - result of running the project's own test suite against THIS source tree
   (``source_hash``), fresh (<= 24 h);
 * ``live_schema_attestation.json`` - minimal, secret-free summary of a GET-only private schema probe
-  (``check-live``) for the same ``base_url`` and source tree, fresh (<= 24 h).
+  (``check-live``) for the same ``base_url`` and source tree, fresh (<= 24 h);
+* ``live_canary.json`` - result of ONE tiny, non-fillable real order that was placed, observed and
+  cancelled (``canary``) against the same ``base_url``, ok and <= 72 h old. It settles the API
+  behaviours a GET-only probe cannot (client_id echo, lookup by id, cancel answer, locked balance).
 
-Nothing here talks to the exchange. The clock is injectable (``now`` = epoch seconds).
+A resumed run (``live --resume``, systemd) may use selftest/attestation evidence up to 48 h old
+(``max_evidence_age_s``); a fresh start always needs <= 24 h. Nothing here talks to the exchange.
+The clock is injectable (``now`` = epoch seconds).
 """
 from __future__ import annotations
 
@@ -37,7 +42,10 @@ SELFTEST_FILE = "selftest.json"
 ATTESTATION_FILE = "live_schema_attestation.json"
 KILL_FILE = "KILL"
 ARMING_FILE = "LIVE_ARMED"
+CANARY_FILE = "live_canary.json"
 MAX_EVIDENCE_AGE_S = 24 * 3600.0
+RESUME_MAX_EVIDENCE_AGE_S = 48 * 3600.0
+MAX_CANARY_AGE_S = 72 * 3600.0
 MAX_FUTURE_SKEW_S = 300.0          # evidence stamped in the future => clock trouble or tampering
 SELFTEST_TIMEOUT_S = 900.0
 
@@ -110,11 +118,19 @@ def _norm_url(url: Any) -> str:
     return str(url or "").strip().rstrip("/").lower()
 
 
+def _amount_text(config: Config) -> str:
+    amt = config.initial_tmn
+    return str(int(amt)) if amt == amt.to_integral_value() else plain(amt)
+
+
 def required_phrase(config: Config) -> str:
     """``START LIVE <initial_tmn>`` with the amount as a plain integer string (e.g. 5000000)."""
-    amt = config.initial_tmn
-    text = str(int(amt)) if amt == amt.to_integral_value() else plain(amt)
-    return f"START LIVE {text}"
+    return f"START LIVE {_amount_text(config)}"
+
+
+def required_canary_phrase(config: Config) -> str:
+    """``RUN CANARY <initial_tmn>``: the canary places a REAL order, so it has its own phrase."""
+    return f"RUN CANARY {_amount_text(config)}"
 
 
 # --------------------------------------------------------------------------- source hash
@@ -252,6 +268,13 @@ def write_schema_attestation(state_dir: str | Path, report: Mapping[str, Any], b
     if at_ts is None:
         reasons.append("report has no valid UTC 'at' timestamp")
     checks = report.get("checks") if isinstance(report.get("checks"), list) else []
+    unverified = sorted(str(u.get("id"))[:80] for u in (report.get("undocumented") or [])
+                        if isinstance(u, Mapping))
+    # items a valid canary (ok, same base_url, <= 72 h at probe time) has already settled
+    by_canary: list[str] = []
+    if at_ts is not None:
+        canary_cfg = Config(api_base=str(base_url))
+        by_canary = [u for u in canary_verified_items(canary_cfg, state_dir, at_ts) if u in unverified]
     att = {
         "ok": not reasons,
         "at": _iso(at_ts) if at_ts is not None else None,
@@ -259,8 +282,8 @@ def write_schema_attestation(state_dir: str | Path, report: Mapping[str, Any], b
         "source_hash": source_hash(package_dir),
         "failed_checks": sorted(str(c.get("name"))[:80] for c in checks
                                 if isinstance(c, Mapping) and not c.get("ok")),
-        "unverified": sorted(str(u.get("id"))[:80] for u in (report.get("undocumented") or [])
-                             if isinstance(u, Mapping)),
+        "unverified": [u for u in unverified if u not in by_canary],
+        "verified_by_canary": by_canary,
         "probe_version": report.get("probe_version"),
         "reasons": reasons,
     }
@@ -270,10 +293,12 @@ def write_schema_attestation(state_dir: str | Path, report: Mapping[str, Any], b
 
 # --------------------------------------------------------------------------- phrase input
 def read_typed_phrase(config: Config, *, input_fn: InputFn | None = None,
-                      stdin: TextIO | None = None) -> str:
-    """Ask the operator to type the confirmation phrase. Refuses a non-interactive stdin (no TTY:
-    pipes, systemd, CI) unless ``input_fn`` is given explicitly (test hook)."""
-    prompt = (f"REAL MONEY. Type exactly '{required_phrase(config)}' to start live trading: ")
+                      stdin: TextIO | None = None, phrase: str | None = None) -> str:
+    """Ask the operator to type the confirmation phrase (``phrase``, default ``START LIVE ...``).
+    Refuses a non-interactive stdin (no TTY: pipes, systemd, CI) unless ``input_fn`` is given
+    explicitly (test hook)."""
+    expected = phrase if phrase is not None else required_phrase(config)
+    prompt = (f"REAL MONEY. Type exactly '{expected}' to continue: ")
     if input_fn is None:
         stream = stdin if stdin is not None else sys.stdin
         try:
@@ -341,7 +366,42 @@ def _evidence_checks(prefix: str, doc: dict[str, Any] | None, err: str | None, *
     return out
 
 
-def _evaluate(config: Config, state_dir: Path, now: float) -> list[dict[str, Any]]:
+def canary_status(config: Config, state_dir: str | Path, now: float,
+                  max_age_s: float = MAX_CANARY_AGE_S) -> tuple[bool, str, dict[str, Any] | None]:
+    """``(met, detail, doc)`` for ``live_canary.json``: present, ``ok: true``, same base_url as the
+    config, a valid UTC timestamp at most ``max_age_s`` old (and not in the future)."""
+    doc, err = _read_json(Path(state_dir) / CANARY_FILE)
+    if doc is None:
+        return False, f"{CANARY_FILE} {err} (run `wallex-agent canary` first)", None
+    problems: list[str] = []
+    if doc.get("ok") is not True:
+        problems.append("ok is not true" + (f" ({'; '.join(map(str, doc.get('reasons') or []))[:160]})"
+                                            if doc.get("reasons") else ""))
+    if _norm_url(doc.get("base_url")) != _norm_url(config.api_base):
+        problems.append(f"base_url {doc.get('base_url')!r} differs from {config.api_base!r}")
+    ts = _parse_iso(doc.get("at"))
+    if ts is None:
+        problems.append("no valid UTC 'at' timestamp")
+    elif now - ts < -MAX_FUTURE_SKEW_S:
+        problems.append(f"dated {(ts - now) / 3600:.2f} h in the future")
+    elif now - ts > max_age_s:
+        problems.append(f"age {(now - ts) / 3600:.2f} h > {max_age_s / 3600:.0f} h")
+    if problems:
+        return False, f"{CANARY_FILE}: " + "; ".join(problems), doc
+    return True, f"{CANARY_FILE} ok, age {max(now - ts, 0) / 3600:.2f} h (max {max_age_s / 3600:.0f} h)", doc
+
+
+def canary_verified_items(config: Config, state_dir: str | Path, now: float) -> list[str]:
+    """API items a valid (ok, same base_url, fresh) canary verified; [] otherwise."""
+    met, _, doc = canary_status(config, state_dir, now)
+    if not met or doc is None:
+        return []
+    return sorted(str(v)[:80] for v in (doc.get("verified") or []) if isinstance(v, str))
+
+
+def _evaluate(config: Config, state_dir: Path, now: float, *,
+              max_evidence_age_s: float = MAX_EVIDENCE_AGE_S,
+              require_canary: bool = True) -> list[dict[str, Any]]:
     current = source_hash()
     conds = [
         _cond("mode_live", config.mode is Mode.LIVE,
@@ -356,32 +416,42 @@ def _evaluate(config: Config, state_dir: Path, now: float) -> list[dict[str, Any
                        f"KILL file present: {', '.join(killed)}" if killed else "no KILL file"))
     st, st_err = _read_json(state_dir / SELFTEST_FILE)
     conds += _evidence_checks("selftest", st, st_err, ok_key="passed", current_hash=current, now=now,
-                              max_age_s=MAX_EVIDENCE_AGE_S)
+                              max_age_s=max_evidence_age_s)
     at, at_err = _read_json(state_dir / ATTESTATION_FILE)
     conds += _evidence_checks("schema_attestation", at, at_err, ok_key="ok", current_hash=current,
-                              now=now, max_age_s=MAX_EVIDENCE_AGE_S, base_url=config.api_base)
+                              now=now, max_age_s=max_evidence_age_s, base_url=config.api_base)
+    if require_canary:
+        met, detail, _ = canary_status(config, state_dir, now)
+        conds.append(_cond("canary_ok", met, detail))
     return conds
 
 
 def check_live_allowed(config: Config, *, flag_ack: bool, typed_phrase: str | None,
                        now: float | None = None, state_dir: str | Path | None = None,
-                       input_fn: InputFn | None = None) -> dict[str, Any]:
+                       input_fn: InputFn | None = None, require_canary: bool = True,
+                       expected_phrase: str | None = None,
+                       max_evidence_age_s: float = MAX_EVIDENCE_AGE_S) -> dict[str, Any]:
     """Raise ``LiveNotAllowedError`` (message + ``.unmet`` list) unless EVERY live condition holds.
 
     If ``typed_phrase`` is None the operator is prompted via ``read_typed_phrase`` (TTY only, or
     ``input_fn``) - but only when every other condition already holds. Returns a secret-free summary
-    of the satisfied gate for the audit log."""
+    of the satisfied gate for the audit log.
+
+    ``require_canary=False`` + ``expected_phrase=required_canary_phrase(config)`` is the gate of the
+    canary order itself (everything else identical). ``max_evidence_age_s`` may be raised to
+    ``RESUME_MAX_EVIDENCE_AGE_S`` only for resuming an already started run; it is capped there."""
     t = float(time.time() if now is None else now)
     sdir = Path(state_dir) if state_dir is not None else config.state_path
-    conds = _evaluate(config, sdir, t)
+    max_age = min(float(max_evidence_age_s), RESUME_MAX_EVIDENCE_AGE_S)
+    conds = _evaluate(config, sdir, t, max_evidence_age_s=max_age, require_canary=require_canary)
     conds.insert(3, _cond("flag_ack", flag_ack is True,
                           "--i-understand-real-money " + ("given" if flag_ack is True else "NOT given")))
-    expected = required_phrase(config)
+    expected = expected_phrase if expected_phrase is not None else required_phrase(config)
     phrase = typed_phrase
     if phrase is None:
         if all(c["met"] for c in conds):
             try:
-                phrase = read_typed_phrase(config, input_fn=input_fn)
+                phrase = read_typed_phrase(config, input_fn=input_fn, phrase=expected)
             except LiveNotAllowedError as exc:
                 conds.append(_cond("typed_phrase", False, str(exc)))
         else:
@@ -399,7 +469,8 @@ def check_live_allowed(config: Config, *, flag_ack: bool, typed_phrase: str | No
         err.unmet = unmet  # type: ignore[attr-defined]
         raise err
     return {"allowed": True, "at": _iso(t), "source_hash": source_hash(), "base_url": config.api_base,
-            "initial_tmn": plain(config.initial_tmn), "conditions": conds}
+            "initial_tmn": plain(config.initial_tmn), "max_evidence_age_h": max_age / 3600,
+            "require_canary": require_canary, "conditions": conds}
 
 
 def arm_status(config: Config, *, now: float | None = None,
@@ -410,6 +481,7 @@ def arm_status(config: Config, *, now: float | None = None,
     conds = _evaluate(config, sdir, t)
     att, _ = _read_json(sdir / ATTESTATION_FILE)
     missing = [c["name"] for c in conds if not c["met"]]
+    canary_verified = canary_verified_items(config, sdir, t)
     return {
         "mode": getattr(config.mode, "value", str(config.mode)),
         "base_url": config.api_base,
@@ -421,7 +493,9 @@ def arm_status(config: Config, *, now: float | None = None,
         "required_at_launch": ["--i-understand-real-money flag",
                                f"typed phrase '{required_phrase(config)}'"],
         "arming_file_present": (sdir / ARMING_FILE).is_file(),
-        "unverified_api_items": list((att or {}).get("unverified") or []),
+        "unverified_api_items": [u for u in (att or {}).get("unverified") or []
+                                 if u not in canary_verified],
+        "canary_verified_api_items": canary_verified,
         "failed_probe_checks": list((att or {}).get("failed_checks") or []),
         "at": _iso(t),
     }

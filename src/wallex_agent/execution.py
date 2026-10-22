@@ -33,7 +33,10 @@ from .types import (BPS, ONE, ORDER_TRANSITIONS, ZERO, Balance, BotState, Market
                     plain, quantize_down, quantize_up)
 
 CORRECTABLE_CODES = frozenset({1001, 1002, 1004, 1006})
-PURPOSES = ("convert", "entry", "exit", "flatten")
+# 'canary': one tiny, deliberately non-fillable USDTTMN BUY used to verify API behaviour before
+# live trading (see canary.py). It goes through the same persist-before-send / kill / unknown-outcome
+# path as every other order; only the strategy/edge gates (risk.py) are not involved.
+PURPOSES = ("convert", "entry", "exit", "flatten", "canary")
 K_RUN = "exec.run_id"
 K_SEQ = "exec.seq"
 K_QUARANTINE = "exec.quarantine"
@@ -191,6 +194,7 @@ class ExecutionEngine:
         self.rng = rng or random.Random()
         self.crash_at: set[str] = set()        # test hook (see SimulatedCrash)
         self.posts = 0                          # create_order calls made by THIS engine object
+        self.last_cancel_error: str | None = None   # exception type of the last cancel_order call
         self._killed = False
         self._rules_cache: dict[str, MarketRules] | None = None
         self._fees_cache: dict[str, Any] | None = None
@@ -374,6 +378,8 @@ class ExecutionEngine:
             "flatten": intent.side is Side.SELL and (
                 (intent.symbol == btc and st is BotState.BTC_HELD)
                 or (intent.symbol == usd and st is BotState.READY)),
+            "canary": intent.side is Side.BUY and intent.symbol == usd
+            and intent.style == "passive_limit" and st in (BotState.UNFUNDED, BotState.READY),
         }.get(intent.purpose, False)
         return None if ok else f"state_mismatch: {intent.purpose} {intent.side.value} {intent.symbol} in {st.value}"
 
@@ -866,6 +872,7 @@ class ExecutionEngine:
             self.exchange.cancel_order(oid)
         except Exception as exc:     # failed, already done, or unknown: the GET below decides
             err = type(exc).__name__
+        self.last_cancel_error = err
         try:
             info = self.exchange.get_order(oid)
         except Exception as exc:
@@ -880,6 +887,33 @@ class ExecutionEngine:
         else:
             self._audit("order_cancelled", {"client_id": rec.client_id, "executed_qty": new.executed_qty})
         return new
+
+    def cancel_and_verify(self, client_id: str) -> OrderRecord:
+        """Cancel ONE of our OPEN/PARTIAL orders and verify the result with ``get_order`` (cancel
+        only; a fill that races the cancel is recorded through the normal fill path)."""
+        rec = self.store.get_order(client_id)
+        if rec is None:
+            raise InvariantError(f"unknown order {client_id!r}")
+        if rec.lifecycle not in (L.OPEN, L.PARTIAL):
+            return rec
+        new = self._cancel_and_verify(rec)
+        self._settle_state()
+        return new
+
+    def cancel_open_orders(self, reason: str = "operator") -> dict[str, Any]:
+        """Cancel (never sell) every OPEN/PARTIAL order of ours and verify each, WITHOUT engaging the
+        kill switch or stopping the bot: used for graceful shutdown and at the deadline, so the run
+        stays resumable."""
+        out: dict[str, Any] = {"reason": reason, "cancelled": [], "still_open": []}
+        for rec in self.store.unresolved_orders():
+            if rec.lifecycle not in (L.OPEN, L.PARTIAL):
+                continue
+            new = self._cancel_and_verify(rec)
+            (out["still_open"] if new.lifecycle in (L.OPEN, L.PARTIAL) else out["cancelled"]).append(
+                new.client_id)
+        self._settle_state()
+        self._audit("cancel_open_orders", out)
+        return out
 
     def poll_and_manage(self) -> dict[str, Any]:
         """Refresh every unresolved order from the exchange, record fills, cancel timed-out orders
