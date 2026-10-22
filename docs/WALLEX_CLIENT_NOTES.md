@@ -80,8 +80,12 @@ by a real (small) order and are listed in the `undocumented` section of every pr
   Runner/config owners should expose an explicit opt-in.
 * Redirects are never followed; a 3xx is an error. TLS >= 1.2 with certificate and hostname
   verification. The wire debug level is pinned to 0. The response is capped at 5 MiB. The timeout applies
-  per socket operation, plus a total read deadline. DNS resolution itself is **not** bounded by the
-  timeout (stdlib limitation).
+  per socket operation while connecting and reading the status line/headers, and as a TOTAL deadline for
+  the body: each body read is one `read1` (at most one recv) with the socket timeout set to the time
+  left, and a watchdog shuts the socket down at the deadline (also covers chunk-size lines read inside
+  http.client). DNS resolution itself is **not** bounded by the timeout (stdlib limitation).
+* Error texts (bodies, messages, transport failures) are scrubbed of the key in FULL before they are
+  truncated, so a key straddling a cut can never leave its prefix behind.
 * Public smoke, 2026-10-22, through the proxy:
   * markets: BTCUSDT (step 8, tick 2, minQty 1e-8, minNotional 1) and USDTTMN (2, 0, 0.01, 50000);
   * depth: 50/50 levels, prices as JSON numbers, no `Content-Encoding` (identity honoured);

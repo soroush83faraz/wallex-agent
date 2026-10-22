@@ -29,7 +29,7 @@ from .reporting import Scrubber, build_final_report, render_trace, verify_chain,
 from .runner import (EXIT_ERROR, EXIT_GATE, EXIT_INTERRUPTED, EXIT_KILLED, EXIT_OK, EXIT_REFUSED,
                      EXIT_STOPPED, EXIT_UNAVAILABLE, EXIT_USAGE, K_BOOKS, K_FEES, K_LABELS, K_START, AgentRunner,
                      RunResult, books_from_kv, fees_from_kv)
-from .store import InstanceLock, InstanceLockError
+from .store import InstanceLockError, probe_lock
 from .types import BPS, ONE, Mode, Side, plain
 
 EXIT_CODES_HELP = f"""exit codes:
@@ -96,6 +96,9 @@ class Ctx:
         return Mode(m) if m else self.default_mode
 
 
+_SIGNAL_NAMES = {int(getattr(signal, n)): n for n in ("SIGINT", "SIGTERM", "SIGBREAK") if hasattr(signal, n)}
+
+
 def out(*parts: Any) -> None:
     print(*parts, flush=True)
 
@@ -116,14 +119,29 @@ def _json(obj: Any) -> str:
 
 
 # --------------------------------------------------------------------------- signals
-def _install_signals(runner: AgentRunner) -> Callable[[], None]:
+class StopFlag:
+    """What a signal handler may touch: one attribute assignment. No I/O, no locks (the main loop
+    may be inside a print or an audit write when the signal arrives)."""
+
+    def __init__(self) -> None:
+        self.reason: str | None = None
+
+    def request_stop(self, reason: str = "signal") -> None:
+        self.reason = reason
+
+    @property
+    def stop_requested(self) -> bool:
+        return self.reason is not None
+
+
+def _install_signals(target: Any) -> Callable[[], None]:
+    """Route SIGINT/SIGTERM/SIGBREAK to ``target.request_stop(name)`` and nothing else; the main
+    loop notices the flag and reports it (``AgentRunner.notify``)."""
     names = ["SIGINT", "SIGTERM", "SIGBREAK"]
     previous: dict[int, Any] = {}
 
     def handler(signum: int, frame: Any) -> None:
-        runner.request_stop(signal.Signals(signum).name)
-        err(f"\n{signal.Signals(signum).name} received: finishing the current step, cancelling resting "
-            "orders (cancel only), writing a partial report...")
+        target.request_stop(_SIGNAL_NAMES.get(signum, "signal"))
 
     for n in names:
         sig = getattr(signal, n, None)
@@ -154,13 +172,17 @@ def _fmt_tmn(v: Any) -> str:
 def print_summary(res: RunResult, rt: Any, title: str) -> None:
     rep = res.report or {}
     labels = rep.get("labels") or []
+    live = rt.mode is Mode.LIVE
     out(f"== {title} ==")
     if "synthetic_data" in labels:
-        out("   SYNTHETIC DATA (seeded random model, not market data); fills SIMULATED; fee ASSUMED")
-    elif rt.mode is not Mode.LIVE:
+        out("   SYNTHETIC DATA (seeded random model, not market data); fills SIMULATED; fee ASSUMED; "
+            "timestamps are SIMULATED time")
+    elif not live:
         out(f"   SIMULATED orders/fills ({rt.mode.value}); fee ASSUMED at {rt.config.paper_fee_rate}")
     out(f"run:        {rt.run_id}")
     out(f"status:     {res.status} (exit {res.exit_code}) - {res.reason}")
+    val = rep.get("value") or {}
+    unverified = live and val.get("verified_against_exchange") is not True
     if rep:
         out(f"period:     {rep.get('started_at')} -> {rep.get('ended_at')} ({rep.get('duration_h')} h)")
         acts = rep.get("decisions_by_action") or {}
@@ -170,25 +192,34 @@ def print_summary(res: RunResult, rt: Any, title: str) -> None:
         out(f"orders:     {orders.get('count', 0)} {orders.get('by_lifecycle', {})}; fills "
             f"{(rep.get('fills') or {}).get('count', 0)}; round trips {rt_.get('count', 0)} "
             f"(wins {rt_.get('wins', 0)}, losses {rt_.get('losses', 0)})")
-        val, pnl = rep.get("value") or {}, rep.get("pnl") or {}
+        pnl = rep.get("pnl") or {}
         out(f"value:      {_fmt_tmn(val.get('initial_tmn'))} TMN -> {_fmt_tmn(val.get('final_tmn_net_of_exit_costs'))} "
-            f"TMN net of exit costs (P&L {pnl.get('abs_tmn')} TMN, {pnl.get('pct')} %)")
-        out(f"target:     {pnl.get('target_statement')}")
+            f"TMN net of exit costs (P&L {pnl.get('abs_tmn')} TMN, {pnl.get('pct')} %)"
+            + ("  [LEDGER-BASED, NOT verified against the exchange balances: "
+               f"{(val.get('exchange_check') or {}).get('detail') or 'no confirmation'}]" if unverified else ""))
+        out(f"target:     {pnl.get('target_statement')}" + (" (unverified)" if unverified else ""))
         fees = rep.get("fees_paid") or {}
         out("fees paid:  " + (", ".join(f"{v} {k}" for k, v in sorted(fees.items())) or "none"))
         holdings = ((rep.get("end") or {}).get("holdings") or {})
-        out("holdings:   " + (", ".join(f"{v} {k}" for k, v in sorted(holdings.items()) if v not in ("0", 0))
-                              or "none"))
+        out(("holdings:   " if not live else "ledger:     ")
+            + (", ".join(f"{v} {k}" for k, v in sorted(holdings.items()) if v not in ("0", 0)) or "none"))
     if res.report_path:
         out(f"report:     {res.report_path}")
     if res.trace_path:
         out(f"trace:      {res.trace_path}")
     ok, bad = verify_chain(rt.audit.path)
     out(f"audit:      {rt.audit.path} (hash chain {'OK' if ok else f'BROKEN at line {bad}'})")
-    out("Past (simulated) results do not predict future results; 2x is not guaranteed.")
+    if live:
+        out("REAL-MONEY run: the numbers above are the bot's own fills ledger valued at the last books"
+            + (", NOT confirmed by the exchange at the end: check the account in the Wallex app"
+               if unverified else ", confirmed against the exchange balances at the end")
+            + ". They say nothing about future results; 2x is not guaranteed.")
+    else:
+        out("Past (simulated) results do not predict future results; 2x is not guaranteed.")
 
 
 def _run(rt: Any, runner: AgentRunner, title: str, **run_kw: Any) -> int:
+    runner.notify = err
     restore = _install_signals(runner)
     try:
         res = runner.run(**run_kw)
@@ -345,6 +376,7 @@ def cmd_selftest(ctx: Ctx) -> int:
     res = live_gate.run_selftest(ctx.config.state_path)
     out(_json({k: res.get(k) for k in ("passed", "tests", "failures", "reason", "source_hash", "at",
                                          "duration_s")}))
+    out(f"written: {ctx.config.state_path / live_gate.SELFTEST_FILE}")
     return EXIT_OK if res.get("passed") else EXIT_ERROR
 
 
@@ -366,6 +398,7 @@ def cmd_check_live(ctx: Ctx) -> int:
     out(_json({"checks": [{"name": c["name"], "ok": c["ok"]} for c in rep.checks],
                "attestation": {k: att[k] for k in ("ok", "at", "base_url", "failed_checks", "unverified",
                                                     "verified_by_canary", "reasons")}}))
+    out(f"written: {cfg.state_path / live_gate.ATTESTATION_FILE}")
     st = live_gate.arm_status(cfg, now=float(time.time() if ctx.clock is None else ctx.clock.now()))
     out("live gate still missing: " + (", ".join(st["missing"]) or "nothing (flag + phrase at launch)"))
     return EXIT_OK if att["ok"] else EXIT_GATE
@@ -386,41 +419,48 @@ def cmd_canary(ctx: Ctx) -> int:
     except InstanceLockError as exc:
         err(f"canary: {exc}")
         return EXIT_REFUSED
+    flag = StopFlag()                       # I5: same flag-only handling as the trading loop
+    restore = _install_signals(flag)
     try:
         rep = rt.engine.reconcile_startup()
         if not rep.get("ok"):
             err(f"canary refused: startup reconciliation not ok (state {rep.get('state')}): "
-                f"{rep.get('actions') or (rep.get('drift') or {}).get('reasons')}")
+                f"{rep.get('actions') or (rep.get('drift') or {}).get('text') or (rep.get('drift') or {}).get('reasons')}")
             return EXIT_STOPPED if rt.sm.state.value == "STOPPED" else EXIT_UNAVAILABLE
         try:
-            doc = run_canary(rt)
+            doc = run_canary(rt, should_stop=lambda: flag.reason)
         except CanaryRefused as exc:
             err(f"canary refused (nothing sent): {exc}")
-            return EXIT_REFUSED
+            return EXIT_INTERRUPTED if flag.stop_requested else EXIT_REFUSED
         out(_json({k: doc[k] for k in ("ok", "at", "base_url", "verified", "reasons", "observations")}))
         if rt.extras.get("canary_holdings"):
             err("!!! THE CANARY ORDER FILLED. Holdings now recorded in the live ledger: "
                 + ", ".join(f"{v} {k}" for k, v in sorted(rt.extras["canary_holdings"].items())))
         out(f"written: {cfg.state_path / live_gate.CANARY_FILE}")
+        if flag.stop_requested:
+            err(f"{flag.reason} received: the canary order was cancelled (cancel only); run the canary again.")
+            return EXIT_INTERRUPTED
         return EXIT_OK if doc["ok"] else EXIT_REFUSED
     finally:
+        restore()
         rt.close()
 
 
 def cmd_arm_live(ctx: Ctx) -> int:
     cfg = _live_cfg(ctx)
+    now = float(time.time() if ctx.clock is None else ctx.clock.now())
     try:
         live_gate.check_live_allowed(cfg, flag_ack=bool(ctx.args.i_understand_real_money), typed_phrase=None,
-                                     input_fn=ctx.input_fn)
+                                     input_fn=ctx.input_fn, now=now)
     except LiveNotAllowedError as exc:
         err(str(exc))
         return EXIT_GATE
+    doc = live_gate.write_arming(cfg, now=now)
     path = cfg.state_path / live_gate.ARMING_FILE
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(live_gate.required_phrase(cfg) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    out(f"armed: {path} written. systemd (ConditionPathExists) may now start `live --resume`. "
-        "Delete the file to disarm.")
+    out(f"armed: {path} written (bound to this source tree, {cfg.api_base}, {cfg.data_dir}; expires "
+        f"{doc['expires_at']}).\n"
+        "It lets `live --resume` (systemd) CONTINUE a competition that you started interactively with "
+        "`live`; it can never start a fresh live run. Delete the file to disarm.")
     return EXIT_OK
 
 
@@ -490,6 +530,7 @@ def cmd_status(ctx: Ctx) -> int:
             snap.close()
     arm = live_gate.arm_status(replace(cfg, mode=Mode.LIVE), now=now)
     info["arm_status"] = {"missing": arm["missing"], "arming_file_present": arm["arming_file_present"],
+                          "arming": arm["arming"],
                           "unverified_api_items": arm["unverified_api_items"],
                           "canary_verified_api_items": arm["canary_verified_api_items"],
                           "required_at_launch": arm["required_at_launch"]}
@@ -497,33 +538,65 @@ def cmd_status(ctx: Ctx) -> int:
     return EXIT_OK
 
 
+def agent_footprint(cfg: Config) -> dict[str, Any]:
+    """Which KILL-obeying agent state (live store, paper runs) exists under ``cfg.data_dir``, and
+    whether an agent holds its instance lock right now. Creates nothing."""
+    from .modes import live_store_path, runs_dir
+    live_db = live_store_path(cfg)
+    live_lock = probe_lock(live_db.parent)
+    paper_runs = sorted(p for p in runs_dir(cfg, Mode.PAPER).glob("*") if (p / "state.db").is_file()) \
+        if runs_dir(cfg, Mode.PAPER).is_dir() else []
+    paper_running = [p.name for p in paper_runs if probe_lock(p) is True]
+    return {"data_dir": str(cfg.state_path), "live_store": str(live_db), "live_store_exists": live_db.is_file(),
+            "live_agent_running": live_lock is True, "live_lock_file": live_lock is not None,
+            "paper_runs": len(paper_runs), "paper_running": paper_running,
+            "any": live_db.is_file() or live_lock is not None or bool(paper_runs)}
+
+
 def cmd_kill(ctx: Ctx) -> int:
     cfg = ctx.config
     a = ctx.args
+    kill_path = Path(cfg.kill_file).absolute()
+    fp = agent_footprint(cfg)
+    if not fp["any"] and not a.force_write:
+        err(f"!!! kill: NO wallex-agent live store, paper run or instance lock under {cfg.state_path}.\n"
+            f"!!! A KILL file at {kill_path} would most likely NOT be seen by your agent, so it was NOT written.\n"
+            "    The agent reads <its DATA_DIR>/KILL. Re-run with the agent's own settings, e.g.\n"
+            "    `wallex-agent --env-file <the agent's env file> kill` or `wallex-agent --data-dir <dir> kill`.\n"
+            "    On a VPS the emergency stop is `sudo systemctl stop wallex-agent` (then `kill` with the\n"
+            "    service's env file). Use --force-write to write the KILL file here anyway (e.g. to block a\n"
+            "    future start from this DATA_DIR).")
+        return EXIT_REFUSED
     cfg.state_path.mkdir(parents=True, exist_ok=True)
-    live_gate.atomic_write_json(cfg.kill_file, {"reason": a.reason, "at": _iso(time.time())})
-    out(f"KILL file written: {cfg.kill_file}. Every mode refuses new orders while it exists; a running agent "
-        "cancels its open orders (cancel only, never sells) and stops at its next check. "
-        "Delete the file to allow trading again.")
+    live_gate.atomic_write_json(kill_path, {"reason": a.reason, "at": _iso(time.time())})
+    out(f"KILL file written: {kill_path}")
+    if not fp["any"]:
+        err(f"WARNING: no agent state was found under {cfg.state_path} (written anyway: --force-write).")
+    out(_json({k: fp[k] for k in ("data_dir", "live_store_exists", "live_agent_running", "paper_runs",
+                                  "paper_running")}))
+    out("Paper and live agents obey KILL: a running agent cancels its own open orders (cancel only, never "
+        "sells) and stops at its next check, and no new paper/live run, canary or arm-live starts while the file "
+        "exists. demo/backtest runs do NOT read this file.\n"
+        "To trade again: delete the KILL file; if a LIVE agent already acted on it (its ledger is now STOPPED), "
+        "check the account and then run `wallex-agent unstop --i-understand-real-money`.")
     if not a.cancel_open:
-        return EXIT_OK
-    if ctx.mode() is not Mode.LIVE:
-        out(f"--cancel-open: {ctx.mode().value} orders are simulated in-process; the running agent cancels them.")
         return EXIT_OK
     from .modes import live_store_path
     from .modes.live import build_cancel_only_runtime
-    lock = InstanceLock(live_store_path(cfg).parent)
-    try:
-        lock.acquire()
-    except InstanceLockError:
-        out("--cancel-open: a live agent is running; it cancels its own open orders at its next kill check.")
+    live_db = live_store_path(cfg)
+    if not live_db.is_file():
+        out(f"--cancel-open: no live store at {live_db}: no real order of this bot can be open there "
+            "(paper orders are simulated in-process; a running paper agent cancels its own).")
         return EXIT_OK
-    lock.release()
-    if not live_store_path(cfg).is_file():
-        out("--cancel-open: no live store: this bot never placed a live order.")
+    if probe_lock(live_db.parent):
+        out("--cancel-open: a LIVE agent is running on this store; it cancels its own open orders at its next "
+            "kill check (within about a second while it waits between cycles).")
         return EXIT_OK
     try:
         rt = build_cancel_only_runtime(cfg, transport=ctx.transport, clock=ctx.clock)
+    except InstanceLockError:
+        out("--cancel-open: a LIVE agent started meanwhile; it cancels its own open orders at its next kill check.")
+        return EXIT_OK
     except (LiveNotAllowedError, ConfigError) as exc:
         err(f"--cancel-open: {exc}")
         return EXIT_REFUSED
@@ -532,8 +605,137 @@ def cmd_kill(ctx: Ctx) -> int:
     finally:
         rt.close()
     out(_json({"cancelled": res["cancelled"], "still_open": res["still_open"], "unresolved": res["unresolved"]}))
-    out("Only THIS bot's recorded orders were touched; nothing was sold.")
+    out("Only THIS bot's recorded LIVE orders were touched; nothing was sold. The live ledger is now STOPPED.")
     return EXIT_OK if not res["still_open"] else EXIT_STOPPED
+
+
+def cmd_unstop(ctx: Ctx) -> int:
+    """F2: leave STOPPED after a human checked the account - only if a read-only reconcile is clean."""
+    cfg = ctx.config
+    kill = Path(cfg.kill_file)
+    if kill.exists():
+        err(f"unstop refused: the KILL file {kill} exists. Delete it yourself first (deliberately: nothing "
+            "removes it automatically), then run `unstop` again.")
+        return EXIT_REFUSED
+    mode = ctx.mode()
+    if mode is Mode.BACKTEST:
+        err("unstop: backtest runs are disposable; start a new one.")
+        return EXIT_USAGE
+    return _unstop_paper(ctx) if mode is Mode.PAPER else _unstop_live(ctx)
+
+
+def _unstop_live(ctx: Ctx) -> int:
+    from .modes import live_store_path
+    from .modes.live import build_unstop_runtime
+    cfg = _live_cfg(ctx)
+    if not ctx.args.i_understand_real_money:
+        err("unstop (live) needs --i-understand-real-money: it re-enables a REAL-money ledger (it never trades "
+            "by itself; you start `live` afterwards).")
+        return EXIT_GATE
+    db = live_store_path(cfg)
+    if not db.is_file():
+        err(f"unstop: no live store at {db}: nothing to unstop.")
+        return EXIT_REFUSED
+    try:
+        rt = build_unstop_runtime(cfg, flag_ack=True, input_fn=ctx.input_fn, transport=ctx.transport,
+                                  clock=ctx.clock)
+    except LiveNotAllowedError as exc:
+        err(str(exc))
+        return EXIT_GATE
+    except InstanceLockError as exc:
+        err(f"unstop: {exc}. Stop the running agent first.")
+        return EXIT_REFUSED
+    try:
+        return _unstop_with(rt, ctx)
+    finally:
+        rt.close()
+
+
+def _unstop_with(rt: Any, ctx: Ctx) -> int:
+    from .types import BotState
+    if rt.sm.state is not BotState.STOPPED:
+        out(f"the {rt.mode.value} ledger is {rt.sm.state.value}, not STOPPED: nothing to do.")
+        return EXIT_OK
+    now = float(rt.clock.now())
+    start = rt.store.kv_get(K_START)
+    if start is not None and now >= float(start) + float(rt.config.competition_hours) * 3600:
+        err(f"unstop refused: the competition window ended at {_iso(float(start) + rt.config.competition_hours * 3600)}"
+            " (STOPPED is the normal end of the run).")
+        return EXIT_REFUSED
+    stop = rt.store.kv_get("exec.stop") or {}
+    hist = rt.sm.history()
+    out(f"STOPPED because: {stop.get('reason') or (hist[-1].get('reason') if hist else 'unknown')}")
+    out("Read-only reconcile (orders, abandoned-order watch, open orders, ledger vs exchange)...")
+    check = rt.engine.unstop_check()
+    out(_json({"drifts": check["drifts"], "problems": check["problems"], "derived_state": check["derived"],
+               "why": check["why"]}))
+    if not check["ok"]:
+        err("unstop REFUSED: the reconcile is not clean (see 'problems' above). Nothing was changed; fix the "
+            "cause (check the account in the Wallex app) and run `unstop` again.")
+        return EXIT_STOPPED
+    to = rt.engine.operator_unstop(check, note="wallex-agent unstop")
+    out(f"unstopped: STOPPED -> {to.value} ({check['why']}). Nothing else was changed: KILL, LIVE_ARMED, the "
+        "evidence files, quarantines and the abandoned-order watch list are untouched. Trading resumes only "
+        "when you start the agent again.")
+    return EXIT_OK
+
+
+def _unstop_paper(ctx: Ctx) -> int:
+    """Paper: the simulated exchange of a finished session no longer exists, so only the store itself
+    can be checked (no unresolved orders, no negative ledger); `paper` always starts a NEW session."""
+    from .modes import AUDIT_NAME, run_paths
+    from .modes.backtest import REFERENCE_RULES
+    from .portfolio import Portfolio
+    from .reporting import AuditLog
+    from .state import StateMachine, derive_state_explained
+    from .store import SqliteStore
+    from .types import Balance, BotState
+    cfg = ctx.config
+    rid, rdir, db = run_paths(cfg, Mode.PAPER, getattr(ctx.args, "run", None))
+    if rid is None or db is None or not db.is_file():
+        err(f"unstop: no paper run found under {cfg.state_path / 'paper'}")
+        return EXIT_REFUSED
+    try:
+        store = SqliteStore(db)
+    except InstanceLockError as exc:
+        err(f"unstop: {exc}")
+        return EXIT_REFUSED
+    try:
+        sm = StateMachine(store)
+        if sm.state is not BotState.STOPPED:
+            out(f"paper run {rid} is {sm.state.value}, not STOPPED: nothing to do.")
+            return EXIT_OK
+        pf = Portfolio(store, Decimal(str(store.kv_get(INITIAL_TMN_KEY) or cfg.initial_tmn)),
+                       btc_symbol=cfg.btc_symbol, usdt_symbol=cfg.usdt_symbol)
+        ledger = pf.expected_balances()
+        problems = [f"order {o.client_id} is {o.lifecycle.value}" for o in store.unresolved_orders()]
+        problems += [f"{a} ledger is negative ({plain(v)})" for a, v in ledger.items() if v < 0]
+        derived, why = derive_state_explained({a: Balance(a, v) for a, v in ledger.items() if v >= 0}, [],
+                                              REFERENCE_RULES, {}, btc_symbol=cfg.btc_symbol,
+                                              usdt_symbol=cfg.usdt_symbol)
+        if derived is BotState.STOPPED:
+            problems.append(f"no state can be derived: {why}")
+        out(_json({"run": rid, "ledger": ledger, "problems": problems, "derived_state": derived.value, "why": why,
+                   "note": "paper: ledger-only check (the session's simulated exchange no longer exists)"}))
+        if problems:
+            err("unstop REFUSED: see 'problems'. Nothing was changed.")
+            return EXIT_STOPPED
+        prev = store.kv_get("exec.stop")
+        with store.transaction():
+            sm.transition(derived, f"operator_unstop (paper, ledger-only): {why}", {"previous_stop": prev},
+                          force=True)
+            store.kv_set("exec.stop", None)
+            store.append("operator_unstop", {"to": derived.value, "previous_stop": prev, "why": why})
+        audit = AuditLog(rdir / AUDIT_NAME, run_id=rid, secrets=[cfg.api_key] if cfg.api_key else [])
+        try:
+            audit.write("operator_unstop", {"to": derived.value, "previous_stop": prev, "why": why})
+        finally:
+            audit.close()
+        out(f"unstopped paper run {rid}: STOPPED -> {derived.value}. `paper` always starts a NEW session; this "
+            "only repairs the stored state.")
+        return EXIT_OK
+    finally:
+        store.close()
 
 
 def cmd_report(ctx: Ctx) -> int:
@@ -553,7 +755,8 @@ def cmd_report(ctx: Ctx) -> int:
         events = list(snap.iter_events())
         end_ts = events[-1].ts if events else time.time()
         caveats = [f"Rebuilt offline from the store; valued at the last books observed by the agent "
-                   f"({_iso(books_ts) or 'none recorded'})."]
+                   f"({_iso(books_ts) or 'none recorded'}). The runner's own final_report.json (if any) is "
+                   "left untouched; this file is final_report.rebuilt.json."]
         if mode is not Mode.LIVE:
             caveats.append(f"Fees ASSUMED at {cfg.paper_fee_rate} ({mode.value}).")
         state = (snap.kv_get("bot_state") or {}).get("state")
@@ -562,11 +765,15 @@ def cmd_report(ctx: Ctx) -> int:
                                  ended_ts=float(end_ts), portfolio=pf, engine_status={"state": state},
                                  store=snap, memory_snapshot=AgentMemory(snap).snapshot(), books_at_end=books,
                                  fees=fees, caveats=caveats, stop_reason=f"rebuilt by `report` (state {state})",
-                                 synthetic_data=bool((snap.kv_get(K_LABELS) or {}).get("synthetic")))
+                                 synthetic_data=bool((snap.kv_get(K_LABELS) or {}).get("synthetic")),
+                                 exchange_check={"verified": None, "detail": "offline rebuild: no exchange "
+                                                 "balances were read"} if mode is Mode.LIVE else None)
     finally:
         snap.close()
     rdir.mkdir(parents=True, exist_ok=True)
-    path = write_final_report(rdir / "final_report.json", rep, secrets=[cfg.api_key] if cfg.api_key else [])
+    # never overwrite the runner's final_report.json (F3): the rebuild is a separate file
+    path = write_final_report(rdir / "final_report.rebuilt.json", rep,
+                              secrets=[cfg.api_key] if cfg.api_key else [])
     out(_json({k: rep.get(k) for k in ("run_id", "mode", "labels", "started_at", "ended_at", "stop_reason")}
               | {"value": rep["value"].get("final_tmn_net_of_exit_costs"), "pnl": rep["pnl"],
                  "orders": rep["orders"]["count"], "fills": rep["fills"]["count"]}))
@@ -592,8 +799,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wallex-agent", description=DESCRIPTION, epilog=EXIT_CODES_HELP,
                                 formatter_class=fmt)
     p.add_argument("--version", action="version", version=f"wallex-agent {__version__}")
-    p.add_argument("--data-dir", help="state directory (default: DATA_DIR or ./state)")
-    p.add_argument("--env-file", default=".env", help="dotenv file to read (default: .env)")
+    p.add_argument("--data-dir", help="state directory (default: DATA_DIR, else ./state of the CURRENT "
+                                      "directory; resolved to an absolute path; live needs it explicitly)")
+    p.add_argument("--env-file", default=".env",
+                   help="dotenv file to read (default: .env in the current directory; on a VPS pass the "
+                        "service's file, e.g. /etc/wallex-agent/wallex-agent.env)")
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
     def add(name: str, help_: str, desc: str | None = None) -> argparse.ArgumentParser:
@@ -657,23 +867,27 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("selftest", "run the test suite and write selftest.json (required for live)")
     s.set_defaults(func=cmd_selftest)
 
-    s = add("arm-live", "after all gates pass interactively, write <state>/LIVE_ARMED for systemd",
-            "Checks every live gate (incl. the typed phrase 'START LIVE <INITIAL_TMN>' at a TTY) and writes "
-            "the arming file that the systemd unit requires (ConditionPathExists) and that `live --resume` "
-            "reads instead of prompting. Delete the file to disarm.")
+    s = add("arm-live", "after all gates pass interactively, write the <state>/LIVE_ARMED record for systemd",
+            "Checks every live gate (incl. the typed phrase 'START LIVE <INITIAL_TMN>' at a TTY) and writes a "
+            "structured arming record (phrase, source hash, base URL, DATA_DIR, expiry = now + "
+            "COMPETITION_HOURS + 24 h) that the systemd unit requires (ConditionPathExists) and that "
+            "`live --resume` reads instead of prompting. --resume only CONTINUES a competition started "
+            "interactively with `live`; it never starts one. Delete the file to disarm.")
     s.add_argument("--i-understand-real-money", action="store_true", help="required")
     s.set_defaults(func=cmd_arm_live)
 
     s = add("live", "LIVE trading with real money (all gates required)",
-            "Gates: ENABLE_LIVE=true, WALLEX_API_KEY, --i-understand-real-money, fresh passing selftest and "
-            "check-live attestation for this source tree (<= 24 h; <= 48 h when resuming a started run), a "
-            "passing canary (<= 72 h), no KILL file, and the typed phrase 'START LIVE <INITIAL_TMN>' "
-            "(--resume reads it from <state>/LIVE_ARMED; no TTY needed). Startup always reconciles orders, "
-            "fills and balances first and refuses to trade on unexplained drift.")
+            "Gates: ENABLE_LIVE=true, WALLEX_API_KEY, an explicit DATA_DIR, --i-understand-real-money, fresh "
+            "passing selftest (full suite) and check-live attestation for this source tree (<= 24 h; <= 48 h "
+            "when resuming a started run), a passing canary (<= 72 h), no KILL file, and the typed phrase "
+            "'START LIVE <INITIAL_TMN>' at a terminal. --resume (systemd) only CONTINUES a competition already "
+            "started in this live store and reads the phrase from a valid, unexpired <state>/LIVE_ARMED "
+            "record (no TTY needed). Startup always reconciles orders, fills and balances first and refuses "
+            "to trade on unexplained drift.")
     s.add_argument("--stage", choices=["convert", "full"], default="full",
                    help="'convert': run ONLY the TMN->USDT conversion, then stop at READY; 'full' (default)")
     s.add_argument("--resume", action="store_true",
-                   help="unattended restart (systemd): phrase from LIVE_ARMED, never prompts")
+                   help="unattended restart (systemd) of a STARTED competition: phrase from LIVE_ARMED")
     s.add_argument("--i-understand-real-money", action="store_true", help="required")
     s.set_defaults(func=cmd_live)
 
@@ -682,16 +896,39 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--run", help="run id (default: the mode's last run)")
     s.set_defaults(func=cmd_status)
 
-    s = add("kill", "engage the kill switch (KILL file); --cancel-open also cancels THIS bot's open orders",
-            "Writes <state>/KILL: every mode refuses new orders and a running agent cancels its open orders "
-            "(cancel only, never sells) and stops. --cancel-open (live, agent not running) cancels the "
-            "open orders recorded in THIS bot's store; it never touches other orders and never sells.")
-    s.add_argument("--cancel-open", action="store_true", help="also cancel this bot's recorded open orders")
+    s = add("kill", "engage the kill switch (<DATA_DIR>/KILL); --cancel-open also cancels THIS bot's live orders",
+            "Writes <DATA_DIR>/KILL (the absolute path is printed). PAPER and LIVE agents obey it: a running "
+            "agent cancels its open orders (cancel only, never sells) and stops; demo/backtest runs do NOT read "
+            "it. Refuses (exit 6, nothing written) when no live store, paper run or instance lock exists under "
+            "DATA_DIR, because the agent then almost certainly uses another DATA_DIR: pass the agent's "
+            "--env-file/--data-dir, or --force-write. On a VPS the emergency stop is `systemctl stop "
+            "wallex-agent`. --cancel-open: whenever <DATA_DIR>/live/state.db exists and no live agent is "
+            "running, cancels the open orders recorded in THIS bot's live store (never other orders, never "
+            "sells) and leaves that ledger STOPPED. To trade again: delete KILL, then `unstop`.")
+    s.add_argument("--cancel-open", action="store_true", help="also cancel this bot's recorded live open orders")
     s.add_argument("--reason", default="operator kill", help="free text stored in the KILL file")
-    s.add_argument("--mode", choices=[m.value for m in Mode], help="mode for --cancel-open (default: TRADING_MODE)")
+    s.add_argument("--force-write", action="store_true",
+                   help="write KILL even though no agent state exists under DATA_DIR")
+    s.add_argument("--mode", choices=[m.value for m in Mode],
+                   help="ignored (kept for old scripts): --cancel-open acts on the live store whenever it exists")
     s.set_defaults(func=cmd_kill)
 
-    s = add("report", "rebuild final_report.json from the store (offline)")
+    s = add("unstop", "leave STOPPED after a human check: read-only reconcile, then the true state",
+            "For a STOPPED live (or paper) ledger. Refuses while the KILL file exists (delete it yourself first). "
+            "Live needs --i-understand-real-money and the same gate evidence as `live --resume`, but uses a "
+            "READ-ONLY client: it re-runs the startup reconcile without sending anything, prints every drift "
+            "(asset, ledger, exchange, shortfall), and ONLY if nothing is unresolved, unexplained or short it "
+            "moves the ledger to the state the facts imply and audit-logs operator_unstop. It removes nothing "
+            "and never trades: start `live` afterwards. Exit 5 = reconcile not clean (nothing changed).")
+    s.add_argument("--mode", choices=[m.value for m in Mode], help="default: TRADING_MODE (paper)")
+    s.add_argument("--run", help="paper: run id (default: the last paper run)")
+    s.add_argument("--i-understand-real-money", action="store_true", help="required for live")
+    s.set_defaults(func=cmd_unstop)
+
+    s = add("report", "rebuild the report from the store (offline) into final_report.rebuilt.json",
+            "Rebuilds the final report offline from the run's store and writes final_report.rebuilt.json next "
+            "to the runner's own final_report.json, which is never overwritten. Live values in a rebuild are "
+            "ledger-based and NOT verified against the exchange.")
     s.add_argument("--mode", choices=[m.value for m in Mode], help="default: TRADING_MODE (paper)")
     s.add_argument("--run", help="run id (default: the mode's last run)")
     s.set_defaults(func=cmd_report)

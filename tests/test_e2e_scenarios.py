@@ -47,6 +47,19 @@ def test_demo_end_to_end_audit_and_final_report(tmp_path):
     assert (rt.run_dir / "trace.txt").read_text(encoding="utf-8").startswith("Audit trace")
     assert rt.sm.state is BotState.STOPPED
     invariants(rt, rt.exchange)
+    # F1 with the REAL planner: the conversion decision carries its alternatives, features, tool
+    # choice, risk verdict, linked order(s), fills and the context it was taken in
+    conv = [d for d in doc["round_trips"]["decisions"] if d["action"] == "CONVERT_TMN_USDT"]
+    assert conv and conv[0]["order_ids"] and conv[0]["fills"]
+    c = conv[0]
+    assert c["strategy"] == "convert" and c["chosen_tool"] == "fx_check" and len(c["alternatives"]) == 2
+    assert c["state_features"]["state"] in ("UNFUNDED", "CONVERTING") and c["risk_verdict"]["approved"]
+    assert c["balances"]["ledger"]["TMN"] == "5000000" and c["equity"] and c["drawdown"]["pct"] is not None
+    assert c["fee_assets"] == ["USDT"] and c["strategy_version"] and c["timestamp"]
+    assert {o["decision_id"] for o in doc["orders"]["list"]} <= {d["decision_id"] for d in
+                                                               doc["round_trips"]["decisions"]}
+    assert doc["clock"] == "simulated" and "SIMULATED market time" in " ".join(doc["honest_caveats"])
+    assert doc["hold_decisions"]["sample"][0]["decision_id"] and doc["hold_decisions"]["by_strategy"]
 
 
 def test_same_seed_same_decisions(tmp_path):

@@ -1,6 +1,7 @@
 # /etc/systemd/system/wallex-agent.service
 #
 # Wallex agent, LIVE mode on a VPS. Paths marked PLACEHOLDER must match your install.
+# Read README_FA.md, docs/VPS_SYSTEMD_FA.md and docs/RUNBOOK_LIVE_FA.md before using it.
 #
 # Install (as root):
 #   useradd --system --home /var/lib/wallex-agent --shell /usr/sbin/nologin wallex-agent
@@ -9,32 +10,53 @@
 #       (WALLEX_API_KEY, TRADING_MODE=live, ENABLE_LIVE=true, INITIAL_TMN, and
 #        DATA_DIR=/var/lib/wallex-agent/state. Key WITHOUT withdrawal permission,
 #        IP allow-listed to this VPS)
+#   shred -u .env     (do not leave a second readable copy of the key; at least chmod 600 it)
 #   systemctl daemon-reload && systemctl enable wallex-agent
 #
-# FIRST START IS NEVER DONE BY SYSTEMD. The operator first runs, interactively, as the
-# wallex-agent user: `wallex-agent selftest`, `wallex-agent check-live`, then
-# `wallex-agent live --i-understand-real-money` (types `START LIVE <initial_tmn>` at the TTY).
-# All live gates are listed in src/wallex_agent/live_gate.py.
+# Every operator command runs as the service user WITH THE SAME ENV FILE as this unit:
+#   sudo -u wallex-agent /opt/wallex-agent/.venv/bin/wallex-agent \
+#        --env-file /etc/wallex-agent/wallex-agent.env <command>
 #
-# ARMING: this unit only starts when the operator has created the arming file
-#   /var/lib/wallex-agent/state/LIVE_ARMED   (content: START LIVE <initial_tmn>)
-# (ConditionPathExists below). Without it, `systemctl start` and boot-time start are
-# silently skipped, so a reboot can never start live trading by accident. Delete the file
-# to disarm. A KILL file in the state dir also stops systemd from (re)starting the service,
-# and the bot checks it before every order.
+# FIRST START IS OPERATOR-INTERACTIVE, NEVER SYSTEMD: `selftest`, `check-live`, `canary`, then
+# `live --i-understand-real-money` (or `live --stage convert ...`) at a terminal, typing the
+# confirmation phrase. That run starts the competition clock. `live --resume` (this unit) only
+# CONTINUES a competition already started in /var/lib/wallex-agent/state/live/state.db; on a store
+# without a started competition it refuses (exit 3) and the unit stays down.
+#
+# ARMING: this unit only starts after the operator ran `arm-live` (interactive, typed phrase). It
+# writes /var/lib/wallex-agent/state/LIVE_ARMED, a record bound to the phrase, this source tree, the
+# base URL, DATA_DIR and an expiry (COMPETITION_HOURS + 24 h). Without it, `systemctl start` and
+# boot-time starts are silently skipped (ConditionPathExists). Delete the file to disarm. A KILL file
+# in the state dir also stops systemd from (re)starting the service, and the bot checks it before
+# every order.
+#
+# PROTECTION MODEL: the gates stop accidents and automated misuse; they do not stop a deliberate
+# attacker running as wallex-agent or root (such a process can read the key and forge evidence).
+# Recommended on Linux, after arming: make the evidence readable but NOT writable by the service user
+# (the directory must be owned by root for the sticky bit to protect root-owned files):
+#   cd /var/lib/wallex-agent/state
+#   chown root:wallex-agent . selftest.json live_schema_attestation.json live_canary.json LIVE_ARMED
+#   chmod 0444 selftest.json live_schema_attestation.json live_canary.json LIVE_ARMED
+#   chmod 1770 .
+# Remove the sealed files as root before re-running those steps (details: docs/VPS_SYSTEMD_FA.md).
+#
+# EMERGENCY STOP: `sudo systemctl stop wallex-agent` (cancels resting orders, never sells), then
+# `kill` with the env file above so nothing restarts it. After a live agent acted on KILL its ledger
+# is STOPPED: delete KILL, check the account, then run `unstop --i-understand-real-money`.
 #
 # WHY A RESTART IS SAFE (Restart=on-failure):
 #   * persist-before-send: each order intent is committed to SQLite (INTENT -> SENDING, with
 #     a balance snapshot) BEFORE the single POST, and a client_id is never POSTed twice.
 #   * on start, `live --resume` runs ExecutionEngine.reconcile_startup(): it resolves every
 #     unresolved/unknown-outcome order from exchange facts (order lookups, open orders, trades,
-#     balance delta), rebuilds the ledger from recorded fills, compares it with the real
-#     balances and goes STOPPED (no trading) on unexplained drift.
+#     balance delta), re-checks every ABANDONED order on the permanent watch list, rebuilds the
+#     ledger from recorded fills, compares it with the real balances and goes STOPPED (no trading)
+#     on unexplained drift.
 #   * the audit log resumes its hash chain, and the competition start time is persisted,
 #     so a restart neither duplicates orders nor resets the 24 h window.
 #   The resume path still re-checks the live gates (fresh selftest/attestation for THIS
-#   source tree, no KILL file). If a gate fails, the service exits and stays down
-#   (StartLimitBurst). It never trades on a failed gate.
+#   source tree, valid arming record, no KILL file). If a gate fails, the service exits and stays
+#   down (RestartPreventExitStatus). It never trades on a failed gate.
 
 [Unit]
 Description=Wallex agent (BTC/USDT spot, LIVE under strict gates)
@@ -53,9 +75,10 @@ Group=wallex-agent
 WorkingDirectory=/opt/wallex-agent
 EnvironmentFile=/etc/wallex-agent/wallex-agent.env
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# `--env-file` is explicit so a stray /opt/wallex-agent/.env can never be merged in.
 # `--resume` never prompts (no TTY here): it takes the confirmation from the operator-created
-# LIVE_ARMED file (`wallex-agent arm-live`), then runs reconcile_startup.
-ExecStart=/opt/wallex-agent/.venv/bin/wallex-agent live --resume --i-understand-real-money
+# LIVE_ARMED record (`wallex-agent arm-live`), then runs reconcile_startup.
+ExecStart=/opt/wallex-agent/.venv/bin/wallex-agent --env-file /etc/wallex-agent/wallex-agent.env live --resume --i-understand-real-money
 Restart=on-failure
 RestartSec=30
 # Exit codes only an operator can fix are never retried (see `wallex-agent --help`):

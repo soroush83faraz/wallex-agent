@@ -18,7 +18,7 @@ from wallex_agent.runner import (EXIT_GATE, EXIT_INTERRUPTED, EXIT_KILLED, EXIT_
                                  EXIT_STOPPED, EXIT_UNAVAILABLE, EXIT_USAGE)
 
 COMMANDS = ["demo", "backtest", "fetch-history", "diagnose", "paper", "check-live", "canary", "selftest",
-            "arm-live", "live", "status", "kill", "report", "trace"]
+            "arm-live", "live", "status", "kill", "unstop", "report", "trace"]
 
 
 def env_for(tmp_path, **kw):
@@ -87,8 +87,14 @@ def test_report_status_trace_after_a_backtest(capsys, tmp_path):
     st = json.loads(out)
     assert code == 0 and st["state"] == "STOPPED" and st["open_orders"] == [] and st["time_left_h"] == 0.0
     assert "arm_status" in st and SENTINEL not in out
+    runs = list((tmp_path / "state" / "backtest" / "runs").glob("*/final_report.json"))
+    assert len(runs) == 1
+    original = runs[0].read_bytes()
     code, out, _ = run_cli(capsys, ["report", "--mode", "backtest"], tmp_path)
-    assert code == 0 and "final_report.json" in out and '"value"' in out
+    assert code == 0 and "final_report.rebuilt.json" in out and '"value"' in out
+    assert runs[0].read_bytes() == original                    # F3: the runner's report is untouched
+    rebuilt = json.loads((runs[0].parent / "final_report.rebuilt.json").read_text(encoding="utf-8"))
+    assert rebuilt["clock"] == "simulated" and "simulated_clock" in rebuilt["labels"]
     code, out, _ = run_cli(capsys, ["trace", "--mode", "backtest", "--last", "2"], tmp_path)
     assert code == 0 and out.startswith("Audit trace") and "OBSERVE" in out
 
@@ -159,7 +165,7 @@ def test_live_canary_arm_refuse_without_gates(capsys, tmp_path):
         code, out, err = run_cli(capsys, argv, tmp_path, input_fn=lambda p: "START LIVE 5000000")
         assert code == EXIT_GATE, (argv, err)
         assert SENTINEL not in out + err
-        assert "unmet" in err or "LIVE_ARMED" in err
+        assert "unmet" in err or "LIVE_ARMED" in err or "first live start must be interactive" in err
     assert not (tmp_path / "state" / "live" / "state.db").exists()
 
 
@@ -171,7 +177,7 @@ def test_check_live_needs_a_key(capsys, tmp_path):
 def test_arm_live_writes_the_arming_file_when_all_gates_pass(capsys, tmp_path, monkeypatch):
     sd = tmp_path / "state"
     sd.mkdir()
-    lg.run_selftest(sd, runner=lambda a, c: (0, "3 passed in 0.1s"))
+    lg.run_selftest(sd, runner=lambda a, c: (0, f"{lg.MIN_SELFTEST_TESTS} passed in 0.1s"))
     import time
     now = time.time()
     iso = lg._iso(now - 60)
@@ -182,20 +188,334 @@ def test_arm_live_writes_the_arming_file_when_all_gates_pass(capsys, tmp_path, m
     code, out, err = run_cli(capsys, ["arm-live", "--i-understand-real-money"], tmp_path, env=env,
                              input_fn=lambda p: "START LIVE 5000000")
     assert code == EXIT_OK, err
-    assert lg.read_arming_phrase(sd) == "START LIVE 5000000"
+    doc, why = lg.read_arming(sd)
+    assert why is None and doc["phrase"] == "START LIVE 5000000" and doc["source_hash"] == lg.source_hash()
+    assert "never start a fresh live run" in out and SENTINEL not in json.dumps(doc)
 
 
 # --------------------------------------------------------------------------- kill
 def test_kill_writes_the_kill_file_and_blocks_runs(capsys, tmp_path):
-    code, out, _ = run_cli(capsys, ["kill", "--reason", "test"], tmp_path)
-    assert code == EXIT_OK and (tmp_path / "state" / "KILL").is_file()
+    # nothing under DATA_DIR yet: refused, nothing written (it would probably miss the agent)
+    code, out, err = run_cli(capsys, ["kill", "--reason", "test"], tmp_path)
+    assert code == EXIT_REFUSED and not (tmp_path / "state" / "KILL").exists()
+    assert str(tmp_path / "state") in err and "systemctl stop wallex-agent" in err
+    code, out, err = run_cli(capsys, ["kill", "--reason", "test", "--force-write"], tmp_path)
+    kill = tmp_path / "state" / "KILL"
+    assert code == EXIT_OK and kill.is_file() and f"KILL file written: {kill}" in out
+    assert "demo/backtest runs do NOT read" in out and "unstop" in out and "WARNING" in err
     code, out, _ = run_cli(capsys, ["paper", "--seconds", "30"], tmp_path, transport=recording_public_transport(),
                            clock=SimClock(1_700_000_000.0))
     assert code == EXIT_KILLED and "killed" in out
     code, out, _ = run_cli(capsys, ["kill", "--cancel-open", "--mode", "live"], tmp_path)
-    assert code == EXIT_OK and "never placed a live order" in out
+    assert code == EXIT_OK and "no live store" in out          # a paper run exists now: no refusal
     code, out, _ = run_cli(capsys, ["status"], tmp_path)
     assert json.loads(out)["kill_file_present"] is True
+
+
+def test_kill_from_another_working_directory_does_not_pretend(capsys, tmp_path, monkeypatch):
+    """M3 / R2: the operator's shell lacks the agent's DATA_DIR: kill must not silently write a KILL
+    file the agent never reads, and every path it prints is absolute."""
+    agent_state = tmp_path / "var-lib" / "state"
+    from wallex_agent.store import SqliteStore
+    SqliteStore(agent_state / "live" / "state.db").close()         # the agent's real store
+    operator_cwd = tmp_path / "home-operator"
+    operator_cwd.mkdir()
+    monkeypatch.chdir(operator_cwd)
+    shell = {"OPERATOR_SHELL": "1"}                    # no DATA_DIR, no TRADING_MODE, no key
+    code, out, err = run_cli(capsys, ["kill", "--cancel-open", "--reason", "emergency"], tmp_path, env=shell)
+    assert code == EXIT_REFUSED and not list(tmp_path.rglob("KILL"))
+    assert str(operator_cwd / "state") in err
+    code, out, err = run_cli(capsys, ["--data-dir", str(agent_state), "kill", "--reason", "emergency"],
+                             tmp_path, env=shell)
+    assert code == EXIT_OK and (agent_state / "KILL").is_file() and str(agent_state / "KILL") in out
+    assert json.loads(out[out.index("{"): out.index("}") + 1])["live_store_exists"] is True
+
+
+def test_config_data_dir_is_absolute_and_explicitness_is_recorded(tmp_path, monkeypatch):
+    from wallex_agent.config import load_config
+    monkeypatch.chdir(tmp_path)
+    c = load_config(env={}, dotenv_path=None)
+    assert c.data_dir == str(tmp_path / "state") and c.data_dir_explicit is False
+    c = load_config(env={"DATA_DIR": "rel/dir"}, dotenv_path=None)
+    assert c.data_dir == str(tmp_path / "rel" / "dir") and c.data_dir_explicit is True
+    c = load_config(env={}, dotenv_path=None, overrides={"data_dir": "x"})
+    assert c.data_dir == str(tmp_path / "x") and c.data_dir_explicit is True
+
+
+def test_live_refuses_the_working_directory_default_data_dir(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for argv in (["live", "--i-understand-real-money"], ["arm-live", "--i-understand-real-money"],
+                 ["canary", "--i-understand-real-money"]):
+        code, out, err = run_cli(capsys, argv, tmp_path, env={"WALLEX_API_KEY": SENTINEL, "ENABLE_LIVE": "true"})
+        assert code == EXIT_GATE and "data_dir_explicit" in err and SENTINEL not in out + err
+
+
+def _cancel_responder(order_id: str, symbol: str = "USDTTMN"):
+    """Fake keyed Wallex for one resting order of ours: GET shows it, DELETE cancels it."""
+    from tests._runner_support import public_responder
+    pub = public_responder()
+    state = {"active": True, "deletes": 0}
+
+    def order_doc():
+        return {"symbol": symbol, "type": "LIMIT", "side": "BUY", "price": "135000", "origQty": "0.38",
+                "origSum": "51300", "executedQty": "0", "executedSum": "0", "executedPercent": 0,
+                "status": "NEW" if state["active"] else "CANCELED", "active": state["active"],
+                "clientOrderId": order_id, "created_at": "2026-10-22T10:00:00Z"}
+
+    def respond(method, url, headers, body):
+        from urllib.parse import urlsplit
+        path = urlsplit(url).path
+        if method == "GET" and path == f"/v1/account/orders/{order_id}":
+            return 200, {}, json.dumps({"success": True, "message": "ok", "result": order_doc()}).encode()
+        if method == "DELETE" and path == "/v1/account/orders":
+            state["active"] = False
+            state["deletes"] += 1
+            return 200, {}, b""
+        return pub(method, url, headers, body)
+    return respond, state
+
+
+def test_kill_cancel_open_acts_on_live_whenever_the_live_store_exists(capsys, tmp_path):
+    """M3: --cancel-open reaches the LIVE store even though TRADING_MODE says paper."""
+    from decimal import Decimal as D
+    from wallex_agent.modes import RecordingTransport
+    from wallex_agent.store import OrderRecord, SqliteStore
+    from wallex_agent.types import OrderLifecycle, Side
+    sd = tmp_path / "state"
+    s = SqliteStore(sd / "live" / "state.db")
+    s.insert_order_intent(OrderRecord(client_id="wa-live-1-abc", symbol="USDTTMN", side=Side.BUY,
+                                      price=D("135000"), quantity=D("0.38"), purpose="canary"))
+    s.update_order("wa-live-1-abc", lifecycle=OrderLifecycle.SENDING)
+    s.update_order("wa-live-1-abc", lifecycle=OrderLifecycle.OPEN, exchange_client_order_id="wa-live-1-abc")
+    s.close()
+    env = env_for(tmp_path, TRADING_MODE="paper")
+    responder, state = _cancel_responder("wa-live-1-abc")
+    code, out, err = run_cli(capsys, ["kill", "--cancel-open", "--reason", "x"], tmp_path, env=env,
+                             transport=RecordingTransport(responder=responder), clock=SimClock(1_800_000_000.0))
+    assert code == EXIT_OK, err
+    assert state["deletes"] == 1 and '"cancelled": [' in out and "wa-live-1-abc" in out
+    from wallex_agent.modes import open_snapshot
+    snap = open_snapshot(sd / "live" / "state.db")
+    try:
+        assert snap.get_order("wa-live-1-abc").lifecycle is OrderLifecycle.CANCELED
+        assert snap.kv_get("bot_state")["state"] == "STOPPED"
+    finally:
+        snap.close()
+    # without the key the live cancel path refuses loudly instead of pretending
+    code, out, err = run_cli(capsys, ["kill", "--cancel-open"], tmp_path, env={"DATA_DIR": str(sd)})
+    assert code == EXIT_REFUSED and "WALLEX_API_KEY" in err
+
+
+# --------------------------------------------------------------------------- unstop (F2)
+BASE = "https://api.wallex.ir"
+UNSTOP_NOW = 1_800_000_000.0
+SHORT_REASON = "needs_manual_reconcile: ledger/exchange shortfall: TMN ledger 5000000 exchange 4000000 short 1000000"
+
+
+def _live_evidence(sd):
+    sd.mkdir(parents=True, exist_ok=True)
+    lg.run_selftest(sd, runner=lambda a, c: (0, f"{lg.MIN_SELFTEST_TESTS} passed in 1s"),
+                    clock=SimClock(UNSTOP_NOW - 60))
+    lg.write_schema_attestation(sd, {"ok": True, "get_only": True, "base_url": BASE, "at": lg._iso(UNSTOP_NOW - 60),
+                                     "checks": [], "undocumented": []}, BASE)
+    lg.atomic_write_json(sd / lg.CANARY_FILE, {"ok": True, "at": lg._iso(UNSTOP_NOW - 60), "base_url": BASE})
+
+
+def _stopped_live_store(sd, *, start=None):
+    from decimal import Decimal as D
+    from wallex_agent.portfolio import Portfolio
+    from wallex_agent.runner import K_START
+    from wallex_agent.state import StateMachine
+    from wallex_agent.store import SqliteStore
+    from wallex_agent.types import BotState
+    s = SqliteStore(sd / "live" / "state.db", clock=SimClock(UNSTOP_NOW - 600))
+    Portfolio(s, D("5000000"))
+    if start is not None:
+        s.kv_set(K_START, start)
+    s.kv_set("exec.stop", {"reason": SHORT_REASON})
+    StateMachine(s, SimClock(UNSTOP_NOW - 600)).transition(BotState.STOPPED, SHORT_REASON)
+    s.close()
+
+
+def _unstop_responder(tmn="5000000"):
+    from urllib.parse import urlsplit
+    from tests._runner_support import public_responder
+    pub = public_responder()
+    docs = {"/v1/account/balances": {"balances": {"TMN": {"asset": "TMN", "faName": "t", "fiat": True,
+                                                          "value": tmn, "locked": "0"}}},
+            "/v1/account/openOrders": {"orders": []}, "/v1/account/trades": {"AccountLatestTrades": []},
+            "/v1/account/fee": {s: {"makerFeeRate": "0.0025", "takerFeeRate": "0.0025", "recent_days_sum": 0}
+                                for s in ("BTCUSDT", "USDTTMN")}}
+    methods = []
+
+    def respond(method, url, headers, body):
+        methods.append(method)
+        path = urlsplit(url).path
+        if method == "GET" and path in docs:
+            return 200, {}, json.dumps({"success": True, "message": "ok", "result": docs[path]}).encode()
+        return pub(method, url, headers, body)
+    return respond, methods
+
+
+def _unstop(capsys, tmp_path, *, tmn="5000000", extra=(), env_extra=None):
+    from wallex_agent.modes import RecordingTransport
+    respond, methods = _unstop_responder(tmn)
+    env = env_for(tmp_path, ENABLE_LIVE="true", TRADING_MODE="live", **(env_extra or {}))
+    code, out, err = run_cli(capsys, ["unstop", *extra], tmp_path, env=env,
+                             transport=RecordingTransport(responder=respond), clock=SimClock(UNSTOP_NOW),
+                             input_fn=lambda p: "START LIVE 5000000")
+    return code, out, err, methods
+
+
+def _live_snapshot(tmp_path):
+    from wallex_agent.modes import open_snapshot
+    return open_snapshot(tmp_path / "state" / "live" / "state.db")
+
+
+def test_unstop_live_after_a_clean_read_only_reconcile(capsys, tmp_path):
+    sd = tmp_path / "state"
+    _live_evidence(sd)
+    _stopped_live_store(sd)
+    code, out, err, methods = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"])
+    assert code == EXIT_OK, err
+    assert "STOPPED because: " + SHORT_REASON in out and "unstopped: STOPPED -> UNFUNDED" in out
+    assert set(methods) == {"GET"}                          # read-only: nothing placed or cancelled
+    snap = _live_snapshot(tmp_path)
+    try:
+        assert snap.kv_get("bot_state")["state"] == "UNFUNDED" and snap.kv_get("exec.stop") is None
+        assert [e.payload["to"] for e in snap.iter_events("operator_unstop")] == ["UNFUNDED"]
+        last = [e.payload for e in snap.iter_events("state_transition")][-1]
+        assert last["forced"] is True and last["from"] == "STOPPED"
+    finally:
+        snap.close()
+    audits = list((sd / "live" / "runs").rglob("audit.jsonl"))
+    assert audits and "operator_unstop" in audits[0].read_text(encoding="utf-8")
+    assert SENTINEL not in out + err
+
+
+def test_unstop_refuses_and_prints_the_numbers_when_the_ledger_is_short(capsys, tmp_path):
+    sd = tmp_path / "state"
+    _live_evidence(sd)
+    _stopped_live_store(sd)
+    code, out, err, methods = _unstop(capsys, tmp_path, tmn="4000000", extra=["--i-understand-real-money"])
+    assert code == EXIT_STOPPED and "unstop REFUSED" in err
+    doc = json.loads(out[out.index("{"): out.rindex("}") + 1])
+    (tmn,) = [d for d in doc["drifts"] if d["asset"] == "TMN"]
+    assert (tmn["ledger"], tmn["exchange"], tmn["shortfall"], tmn["verdict"]) == ("5000000", "4000000", "1000000",
+                                                                                 "short")
+    assert any("TMN ledger 5000000 exchange 4000000 short 1000000" in p for p in doc["problems"])
+    snap = _live_snapshot(tmp_path)
+    try:
+        assert snap.kv_get("bot_state")["state"] == "STOPPED"            # nothing changed
+    finally:
+        snap.close()
+    assert set(methods) == {"GET"}
+
+
+def test_unstop_refusals_kill_flag_running_agent_and_finished_competition(capsys, tmp_path):
+    sd = tmp_path / "state"
+    _live_evidence(sd)
+    _stopped_live_store(sd)
+    code, out, err, _ = _unstop(capsys, tmp_path)                              # no flag
+    assert code == EXIT_GATE and "--i-understand-real-money" in err
+    (sd / "KILL").write_text("x", encoding="utf-8")
+    code, out, err, _ = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"])
+    assert code == EXIT_REFUSED and "Delete it yourself first" in err and (sd / "KILL").exists()
+    (sd / "KILL").unlink()
+    from wallex_agent.store import SqliteStore
+    agent = SqliteStore(sd / "live" / "state.db")                              # a live agent is running
+    try:
+        code, out, err, _ = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"])
+        assert code == EXIT_REFUSED and "Stop the running agent first" in err
+    finally:
+        agent.close()
+    sd2 = tmp_path / "s2"
+    _live_evidence(sd2)
+    _stopped_live_store(sd2, start=UNSTOP_NOW - 30 * 3600)                     # 24 h window is over
+    code, out, err, _ = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"],
+                                env_extra={"DATA_DIR": str(sd2)})
+    assert code == EXIT_REFUSED and "competition window ended" in err
+
+
+def test_unstop_paper_is_a_ledger_only_check(capsys, tmp_path):
+    sd = tmp_path / "state"
+    assert run_cli(capsys, ["kill", "--force-write"], tmp_path)[0] == EXIT_OK
+    code, out, _ = run_cli(capsys, ["paper", "--seconds", "30"], tmp_path, transport=recording_public_transport(),
+                           clock=SimClock(1_700_000_000.0))
+    assert code == EXIT_KILLED
+    code, out, err = run_cli(capsys, ["unstop", "--mode", "paper"], tmp_path)
+    assert code == EXIT_REFUSED and "Delete it yourself first" in err
+    (sd / "KILL").unlink()
+    code, out, err = run_cli(capsys, ["unstop", "--mode", "paper"], tmp_path)
+    assert code == EXIT_OK, err
+    assert "STOPPED -> UNFUNDED" in out and "ledger-only" in out
+
+
+# --------------------------------------------------------------------------- summary texts (F3)
+def _summary(capsys, tmp_path, mode, verified):
+    from types import SimpleNamespace
+    from wallex_agent.config import Config
+    from wallex_agent.reporting import AuditLog
+    from wallex_agent.runner import RunResult
+    from wallex_agent.types import Mode
+    log = AuditLog(tmp_path / f"a-{mode}-{verified}.jsonl", run_id="r", clock=SimClock(1_700_000_000.0))
+    log.write("observe", {})
+    log.close()
+    rt = SimpleNamespace(mode=Mode(mode), run_id="live-x", config=Config(), audit=log)
+    rep = {"labels": [], "value": {"initial_tmn": "5000000", "final_tmn_net_of_exit_costs": "5100000",
+                                   "verified_against_exchange": verified,
+                                   "exchange_check": {"detail": "exchange balances unavailable (TransportError)"}},
+           "pnl": {"abs_tmn": "100000", "pct": "2", "target_statement": "Target 2x NOT reached"},
+           "end": {"holdings": {"USDT": "18.1"}}}
+    cli.print_summary(RunResult("deadline", 0, 3, "deadline", report=rep), rt, "TITLE")
+    return capsys.readouterr().out
+
+
+def test_live_summary_is_not_simulated_and_flags_an_unverified_value(capsys, tmp_path):
+    out = _summary(capsys, tmp_path, "live", None)
+    assert "Past (simulated)" not in out and "REAL-MONEY run" in out
+    assert "LEDGER-BASED, NOT verified against the exchange balances" in out and "(unverified)" in out
+    out = _summary(capsys, tmp_path, "live", True)
+    assert "NOT verified" not in out and "confirmed against the exchange balances" in out
+    out = _summary(capsys, tmp_path, "paper", None)
+    assert "Past (simulated) results" in out and "REAL-MONEY" not in out and "NOT verified" not in out
+
+
+# --------------------------------------------------------------------------- signals
+def test_signal_handler_only_sets_a_flag(monkeypatch):
+    """L5: the handler runs between two bytecodes of the main loop (possibly inside a print or an
+    audit write): it must do no I/O at all, only flag the stop."""
+    import signal as _signal
+
+    class Boom(io.StringIO):
+        def write(self, s):
+            raise AssertionError("I/O from inside the signal handler")
+
+    flag = cli.StopFlag()
+    restore = cli._install_signals(flag)
+    try:
+        handler = _signal.getsignal(_signal.SIGINT)
+        monkeypatch.setattr("sys.stdout", Boom())
+        monkeypatch.setattr("sys.stderr", Boom())
+        handler(_signal.SIGINT, None)
+        assert flag.stop_requested and flag.reason == "SIGINT"
+    finally:
+        restore()
+    assert _signal.getsignal(_signal.SIGINT) is not handler
+
+
+def test_runner_announces_the_stop_from_the_main_loop(tmp_path):
+    from tests._runner_support import hold_script, sim_world
+    from wallex_agent.runner import AgentRunner
+    w = sim_world(tmp_path)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    said = []
+    r.notify = said.append
+    r.request_stop("SIGTERM")                       # what the handler does
+    assert said == []                               # nothing printed by the handler path
+    res = r.run()
+    assert res.status == "interrupted" and len(said) == 1 and said[0].startswith("SIGTERM received")
 
 
 # --------------------------------------------------------------------------- secrets

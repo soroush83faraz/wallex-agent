@@ -11,10 +11,12 @@ from pathlib import Path
 
 import pytest
 
+from wallex_agent import store as store_mod
 from wallex_agent.clock import SimClock
 from wallex_agent.errors import InvariantError
-from wallex_agent.store import (LOCK_FILENAME, FillRecord, InMemoryStore, InstanceLockError, OrderRecord,
-                                SqliteStore, StoreError, dumps, pid_alive)
+from wallex_agent.store import (LOCK_FILENAME, FillRecord, InMemoryStore, InstanceLock, InstanceLockError,
+                                OrderRecord, SqliteStore, StoreError, dumps, pid_alive, probe_lock,
+                                read_lock_info)
 from wallex_agent.types import ORDER_TRANSITIONS, OrderLifecycle as L, Side
 
 SRC = str(Path(__file__).resolve().parents[1] / "src")
@@ -68,7 +70,7 @@ def test_corrupt_db_fails_closed_and_releases_lock(tmp_path):
     (tmp_path / "db.sqlite").write_bytes(b"this is not a sqlite database at all" * 100)
     with pytest.raises(StoreError):
         SqliteStore(tmp_path / "db.sqlite")
-    assert not (tmp_path / LOCK_FILENAME).exists()
+    assert probe_lock(tmp_path) is False             # file kept (never deleted), OS lock released
 
 
 # --------------------------------------------------------------------------- decimals
@@ -307,7 +309,7 @@ def test_state_survives_close_and_reopen(tmp_path):
         s.add_fill(fill())
         s.append("decision", {"edge": D("0.0040")})
         s.kv_set("bot_state", {"state": "BUY_PENDING"})
-    assert not (tmp_path / LOCK_FILENAME).exists()
+    assert probe_lock(tmp_path) is False
     with SqliteStore(p) as s:
         assert s.get_order("c1").lifecycle is L.OPEN
         assert s.list_fills() == [fill()]
@@ -335,8 +337,8 @@ def test_crash_after_persist_before_send_is_recovered(tmp_path):
     """)
     assert r.returncode == 3, r.stderr
     lock = json.loads((tmp_path / LOCK_FILENAME).read_text())
-    assert not pid_alive(lock["pid"])
-    with SqliteStore(p) as s:                           # stale lock reclaimed
+    assert not pid_alive(lock["pid"])                   # informational content of the dead holder
+    with SqliteStore(p) as s:                           # the kernel released the dead holder's lock
         [rec] = s.unresolved_orders()
         assert rec.client_id == "wa-1" and rec.lifecycle is L.SENDING
         assert rec.price == D("81000.12") and rec.quantity == D("0.00012345")
@@ -369,29 +371,119 @@ def test_second_process_is_refused(tmp_path):
             sys.exit(0)
         """)
         assert r.returncode == 7, r.stdout + r.stderr
-        assert "another instance" in r.stdout or "held open" in r.stdout
+        assert "another instance" in r.stdout and str(os.getpid()) in r.stdout
 
 
-def test_stale_lock_with_dead_pid_is_reclaimed(tmp_path):
-    (tmp_path / LOCK_FILENAME).write_text(json.dumps(
-        {"pid": dead_pid(), "host": socket.gethostname(), "token": "old", "created": 0}))
-    with SqliteStore(tmp_path / "db.sqlite") as s:
-        info = json.loads(s.lock_path.read_text())
-        assert info["pid"] == os.getpid() and info["token"] != "old"
-    assert not list(tmp_path.glob(LOCK_FILENAME + "*"))
+def _holder(db: Path) -> subprocess.Popen:
+    """A separate process that opens the store (taking the lock) and then just waits."""
+    p = subprocess.Popen([sys.executable, "-c", textwrap.dedent(f"""
+        import sys, time
+        from wallex_agent.store import SqliteStore
+        s = SqliteStore(r"{db}")
+        print("LOCKED", flush=True)
+        time.sleep(120)
+    """)], env=dict(os.environ, PYTHONPATH=SRC), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    line = p.stdout.readline().strip()
+    assert line == "LOCKED", (line, p.stderr.read() if p.poll() is not None else "")
+    return p
 
 
-def test_foreign_or_fresh_unreadable_lock_is_not_stolen(tmp_path):
+def test_cross_process_lock_held_until_the_holder_dies(tmp_path):
+    """M2: a second PROCESS cannot own the store while the first lives; when the first is killed
+    (no clean release, no file cleanup) the kernel drops the lock and a new owner can start."""
+    db = tmp_path / "live" / "state.db"
+    holder = _holder(db)
+    try:
+        with pytest.raises(InstanceLockError, match="another instance"):
+            SqliteStore(db)
+        assert probe_lock(db.parent) is True
+        assert read_lock_info(db.parent / LOCK_FILENAME)["pid"] == holder.pid    # informational
+        r = run_py(f"""
+            import sys
+            from wallex_agent.store import SqliteStore, InstanceLockError
+            try:
+                SqliteStore(r"{db}")
+            except InstanceLockError:
+                sys.exit(7)
+            sys.exit(0)
+        """)
+        assert r.returncode == 7, r.stdout + r.stderr          # a third process is refused too
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+        holder.stdout.close()
+        holder.stderr.close()
+    deadline = time.monotonic() + 15
+    while True:                      # Windows may take a moment to tear the dead process's handles down
+        try:
+            s = SqliteStore(db)
+            break
+        except InstanceLockError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+    try:
+        assert read_lock_info(s.lock_path)["pid"] == os.getpid()
+        assert probe_lock(db.parent) is True
+    finally:
+        s.close()
+    assert probe_lock(db.parent) is False and s.lock_path.exists()
+
+
+def test_lock_file_content_is_informational_only(tmp_path):
+    """A leftover file (dead pid, foreign host, garbage, empty) never blocks: only the OS lock counts."""
     lock = tmp_path / LOCK_FILENAME
-    lock.write_text(json.dumps({"pid": dead_pid(), "host": "some-other-host", "token": "t"}))
-    with pytest.raises(InstanceLockError):
-        SqliteStore(tmp_path / "db.sqlite")
-    lock.write_text("")                                   # being written right now
-    with pytest.raises(InstanceLockError):
-        SqliteStore(tmp_path / "db.sqlite")
-    old = time.time() - 3600
-    os.utime(lock, (old, old))                            # unreadable and old => crashed writer
-    SqliteStore(tmp_path / "db.sqlite").close()
+    for content in (json.dumps({"pid": dead_pid(), "host": socket.gethostname()}),
+                    json.dumps({"pid": 1, "host": "some-other-host"}), "", "%%garbage"):
+        lock.write_text(content)
+        with SqliteStore(tmp_path / "db.sqlite") as s:
+            info = read_lock_info(s.lock_path)
+            assert info["pid"] == os.getpid() and info["host"] == socket.gethostname()
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(LOCK_FILENAME)) == [LOCK_FILENAME]
+
+
+def test_held_lock_is_never_stolen_whatever_the_file_says(tmp_path):
+    s = SqliteStore(tmp_path / "db.sqlite")
+    try:
+        (tmp_path / LOCK_FILENAME).write_text(json.dumps({"pid": dead_pid(), "host": socket.gethostname()}))
+        with pytest.raises(InstanceLockError):
+            SqliteStore(tmp_path / "db.sqlite")
+        with pytest.raises(InstanceLockError):
+            InstanceLock(tmp_path).acquire()
+    finally:
+        s.close()
+
+
+def test_lock_file_is_never_deleted_or_renamed(tmp_path):
+    first = InstanceLock(tmp_path)
+    first.acquire()
+    ino = os.stat(first.path).st_ino
+    first.release()
+    for _ in range(3):
+        with SqliteStore(tmp_path / "db.sqlite"):
+            pass
+        assert os.stat(tmp_path / LOCK_FILENAME).st_ino == ino     # same file throughout
+    assert not [p for p in tmp_path.iterdir() if ".stale" in p.name]
+
+
+def test_probe_lock_creates_nothing(tmp_path):
+    d = tmp_path / "never-used"
+    assert probe_lock(d) is None and not d.exists()
+    lk = InstanceLock(d)
+    lk.acquire()
+    assert probe_lock(d) is True             # another handle in THIS process is refused as well
+    lk.release()
+    assert probe_lock(d) is False
+
+
+def test_lock_primitives_are_import_safe_and_fail_closed(tmp_path, monkeypatch):
+    # exactly one primitive exists on each OS; the other import is optional and absent
+    assert (store_mod._fcntl is not None) == (os.name == "posix")
+    assert (store_mod._msvcrt is not None) == (os.name == "nt")
+    monkeypatch.setattr(store_mod, "_fcntl", None)
+    monkeypatch.setattr(store_mod, "_msvcrt", None)
+    with pytest.raises(InstanceLockError, match="no OS file-locking"):
+        SqliteStore(tmp_path / "db.sqlite")          # no lock primitive => refuse to run
 
 
 def test_pid_alive():

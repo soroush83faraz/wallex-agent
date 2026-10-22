@@ -96,8 +96,13 @@ class AgentBrain:
 
     step_decide = decide
 
-    def record_decision(self, d: Decision) -> int:
-        return self.memory.record_decision(d, extra={"points": self._pending_points.pop(d.decision_id, [])})
+    def record_decision(self, d: Decision, context: Mapping[str, Any] | None = None) -> int:
+        """Persist ``d`` (event-sourced). ``context``: what the runner saw when the decision was taken
+        (ledger and exchange balances, equity, peak, drawdown, state) - reported, never replayed."""
+        extra: dict[str, Any] = {"points": self._pending_points.pop(d.decision_id, [])}
+        if context:
+            extra["context"] = dict(context)
+        return self.memory.record_decision(d, extra=extra)
 
     # ------------------------------------------------------------------ verify
     def on_order_result(self, decision_id: str, result: Any) -> dict[str, Any]:

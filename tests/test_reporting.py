@@ -116,6 +116,72 @@ def test_torn_tail_is_dropped_and_recorded(tmp_path):
     assert verify_chain(p) == (True, None)
 
 
+@pytest.mark.parametrize("durable", [True, False])
+def test_interrupt_mid_write_never_breaks_the_chain(tmp_path, durable):
+    """L5: a signal/KeyboardInterrupt while a line is half written must not fork the chain or leave a
+    half line in the middle of the log; seq/hash only advance once the line is in the file."""
+    p = tmp_path / "audit.jsonl"
+    log = AuditLog(p, run_id="r", clock=SimClock(1_700_000_000.0), durable=durable)
+    log.write("a", {"i": 1})
+    real = log._raw_write
+
+    def half_then_interrupt(line):
+        import os as _os
+        _os.write(log._fh.fileno(), line[: len(line) // 2])
+        raise KeyboardInterrupt
+
+    log._raw_write = half_then_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        log.write("b_torn", {"i": 2})
+    assert log.seq == 1                                    # state NOT advanced
+    log._raw_write = real
+    log.write("c", {"i": 3})
+    log.close()
+    assert verify_chain(p) == (True, None)
+    assert [(r["seq"], r["kind"]) for r in read_audit(p)] == [(1, "a"), (2, "c")]
+
+
+def test_interrupt_after_the_line_landed_keeps_it(tmp_path):
+    p = tmp_path / "audit.jsonl"
+    log = AuditLog(p, run_id="r", clock=SimClock(1_700_000_000.0))
+    log.write("a", {})
+    real = log._raw_write
+
+    def write_then_interrupt(line):
+        real(line)
+        raise KeyboardInterrupt                            # e.g. arrives between fsync and commit
+
+    log._raw_write = write_then_interrupt
+    with pytest.raises(KeyboardInterrupt):
+        log.write("b", {})
+    log._raw_write = real
+    log.write("c", {})
+    log.close()
+    assert verify_chain(p) == (True, None)
+    assert [r["kind"] for r in read_audit(p)] == ["a", "b", "c"]
+
+
+def test_close_after_an_interrupted_write_leaves_a_valid_log(tmp_path):
+    p = tmp_path / "audit.jsonl"
+    log = AuditLog(p, run_id="r", clock=SimClock(1_700_000_000.0))
+    log.write("a", {})
+
+    def boom(line):
+        import os as _os
+        _os.write(log._fh.fileno(), line[:7])
+        raise OSError("disk full")
+
+    log._raw_write = boom
+    with pytest.raises(OSError):
+        log.write("b", {})
+    log.close()
+    assert verify_chain(p) == (True, None) and [r["kind"] for r in read_audit(p)] == ["a"]
+    log2 = AuditLog(p, run_id="r2", clock=SimClock(1_700_000_100.0))
+    log2.write("c", {})
+    log2.close()
+    assert [r["seq"] for r in read_audit(p)] == [1, 2] and verify_chain(p) == (True, None)
+
+
 def test_complete_record_missing_only_newline_is_kept(tmp_path):
     p = tmp_path / "audit.jsonl"
     write_n(p, 3).close()
@@ -284,6 +350,37 @@ def test_report_live_mode_and_unknown_fee(tmp_path):
     assert rep["value"]["final_tmn_net_of_exit_costs"] is None
     assert any("unknown_fee:USDTTMN" in c for c in rep["honest_caveats"])
     assert any("This run was LIVE" in c for c in rep["honest_caveats"])
+
+
+def test_report_strategy_comes_from_the_hypothesis_strategy_key(tmp_path):
+    """F1: the planner stores the strategy under hypothesis['strategy'] (not 'name')."""
+    w = make_world(tmp_path)
+    assert w.engine.convert_tmn_to_usdt(decision_id="d-9").status == "done"
+    w.store.append("decision", {"decision": {"decision_id": "d-9", "action": "CONVERT_TMN_USDT",
+                                             "hypothesis": {"strategy": "convert"}, "chosen_tool": "fx_check",
+                                             "alternatives": [{"strategy": "convert_wait"}],
+                                             "state_features": {"state": "UNFUNDED"}, "ts": 1_700_000_000.0},
+                                "context": {"ledger": {"TMN": "5000000"}, "equity_tmn_net": "5000000",
+                                            "peak_equity_tmn": "5000000", "drawdown_pct": "0"}})
+    rep = report_for(w)
+    (d,) = rep["round_trips"]["decisions"]
+    assert d["strategy"] == "convert" and d["chosen_tool"] == "fx_check" and d["alternatives"]
+    assert d["order_ids"] and d["fills"] and d["balances"]["ledger"] == {"TMN": "5000000"}
+    assert rep["orders_without_decision"] == []
+
+
+def test_live_report_flags_an_unverified_valuation(tmp_path):
+    """F3: a live report must not present the ledger valuation as fact if the exchange could not
+    confirm it at the end."""
+    w = run_scenario(tmp_path)
+    rep = report_for(w, mode=Mode.LIVE, synthetic_data=False,
+                     exchange_check={"verified": None, "detail": "exchange balances unavailable (TransportError)"})
+    assert "valuation_unverified" in rep["labels"] and rep["value"]["verified_against_exchange"] is None
+    assert any("NOT verified against the exchange" in c for c in rep["honest_caveats"])
+    ok = report_for(w, mode=Mode.LIVE, synthetic_data=False, exchange_check={"verified": True, "detail": ""})
+    assert "valuation_unverified" not in ok["labels"] and ok["value"]["verified_against_exchange"] is True
+    paper = report_for(w)
+    assert paper["value"]["verified_against_exchange"] is None and paper["clock"] == "real"
 
 
 def test_report_flags_flatten_policy_with_btc_left(tmp_path):

@@ -90,6 +90,41 @@ def test_start_reconciles_first_and_competition_start_survives_restart(tmp_path)
     assert rt2.store.kv_get(K_START) == first and r2.deadline_ts == first + 24 * 3600
 
 
+SPEC_FIELDS = ("action", "rationale", "confidence", "estimated_net_edge", "alternatives", "state_features",
+               "chosen_tool", "tool_calls", "order_ids", "fills", "fee_assets", "balances", "equity", "drawdown",
+               "hypothesis", "result", "outcome", "reflection", "timestamp", "strategy_version", "strategy",
+               "risk_verdict")
+
+
+def test_final_report_lists_every_executed_decision_with_the_spec_fields(tmp_path):
+    """F1: per executed decision: action, rationale, confidence, edge, alternatives, state features,
+    tool choice, order ids, fills, fee asset, balances, equity, drawdown, hypothesis/result, timestamp,
+    strategy version - and the orders are really linked (no more `order_ids: []`)."""
+    w = sim_world(tmp_path, min_trade_interval_s=60.0)
+    rt = w.runtime(trader_script(buy_every=3, hold_cycles=2))
+    _, res = run(rt, max_cycles=9)
+    rep = json.loads(res.report_path.read_text(encoding="utf-8"))
+    entries = rep["round_trips"]["decisions"]
+    actions = {e["action"] for e in entries}
+    assert {"CONVERT_TMN_USDT", "BUY_BTC", "SELL_BTC"} <= actions
+    executed = [e for e in entries if e["order_ids"]]
+    assert len(executed) >= 3
+    for e in executed:
+        missing = [k for k in SPEC_FIELDS if k not in e]
+        assert not missing, (e["decision_id"], missing)
+        assert e["fills"] and e["fee_assets"] and e["strategy"] == "scripted" and e["strategy_version"]
+        assert e["balances"]["ledger"] and e["balances"]["exchange"] and e["equity"]["peak_tmn"]
+        assert e["risk_verdict"]["approved"] is True and e["timestamp"]
+        assert all(f["client_id"] in e["order_ids"] for f in e["fills"])
+    every_order = {o["client_id"] for o in rep["orders"]["list"]}
+    assert every_order == {c for e in executed for c in e["order_ids"]}       # each order linked
+    assert rep["orders_without_decision"] == []
+    assert all(o["decision_id"] for o in rep["orders"]["list"])                # conversion included
+    holds = rep["hold_decisions"]
+    assert holds["count"] == rep["decisions_by_action"].get("HOLD", 0) and holds["sample"]
+    assert rep["clock"] == "simulated" and "simulated_clock" in rep["labels"]
+
+
 # --------------------------------------------------------------------------- failures
 def test_cycle_exceptions_are_audited_counted_and_stop_after_n(tmp_path, monkeypatch):
     w = sim_world(tmp_path, min_trade_interval_s=30.0, order_timeout_s=10_000)
@@ -184,6 +219,25 @@ def test_stop_request_cancels_resting_orders_and_leaves_a_resumable_state(tmp_pa
     assert any("PARTIAL" in c for c in doc["honest_caveats"])
 
 
+def test_conversion_orders_carry_the_decision_id_and_the_stop_check(tmp_path):
+    """F1: the conversion order is linked to the CONVERT decision; L1: the runner hands the stage a
+    stop check covering signals and the deadline."""
+    w = sim_world(tmp_path)
+    rt = w.runtime(trader_script())
+    r = AgentRunner(rt)
+    assert r.start() is None
+    once(r)
+    conv = [o for o in rt.store.list_orders() if o.symbol == USD]
+    decided = [d.decision_id for d in rt.brain.decided if d.action is Action.CONVERT_TMN_USDT]
+    assert conv and decided and {o.decision_id for o in conv} == {decided[0]}
+    assert r._conversion_stop_reason() is None
+    r.request_stop("SIGTERM")
+    assert r._conversion_stop_reason() == "shutdown requested (SIGTERM)"
+    r2 = AgentRunner(rt)
+    r2.deadline_ts = w.clock.now() - 1
+    assert r2._conversion_stop_reason() == "competition deadline reached"
+
+
 def test_stage_convert_runs_only_the_conversion_and_stops_at_ready(tmp_path):
     w = sim_world(tmp_path)
     rt = w.runtime(trader_script(buy_every=1))     # would buy immediately if allowed
@@ -204,6 +258,60 @@ def test_stage_convert_blocks_non_conversion_intents(tmp_path):
     v = [x["payload"] for x in read_audit(rt.audit.path) if x["kind"] == "risk_verdict"]
     assert all(p["blocked"] for p in v)
     assert w.sim.order_count() == 0
+
+
+def _crash_after_post(w, rt, stage="after_post"):
+    from wallex_agent.execution import SimulatedCrash
+    from wallex_agent.types import TradeIntent
+    rt.engine.convert_tmn_to_usdt()
+    rt.engine.crash_at = {stage}
+    book = w.source.get_book(BTC)
+    with pytest.raises(SimulatedCrash):
+        rt.engine.submit(TradeIntent("entry", Side.BUY, BTC, D("0.00005"), book.best_ask, D("20"),
+                                     style="passive_limit"))
+    rt.engine.crash_at = set()
+    rec = rt.store.list_orders()[-1]
+    assert rec.lifecycle is OrderLifecycle.SENDING          # POSTed, outcome never recorded
+    return rec.client_id
+
+
+def test_shutdown_resolves_an_unknown_order_and_cancels_it(tmp_path):
+    """I7: finish() adopts SENDING/UNKNOWN_OUTCOME orders with one lookup, then cancels (cancel only)."""
+    w = sim_world(tmp_path, order_timeout_s=10_000)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    assert r.start() is None
+    cid = _crash_after_post(w, rt)
+    res = r.finish("interrupted")
+    assert rt.store.get_order(cid).lifecycle is OrderLifecycle.CANCELED
+    assert not any(o.active for o in w.sim.all_orders())
+    assert not [o for o in w.sim.all_orders() if o.side is Side.SELL]
+    assert res.status == "interrupted" and rt.sm.state is BotState.READY
+
+
+def test_safety_stop_also_resolves_unknown_orders(tmp_path):
+    w = sim_world(tmp_path, order_timeout_s=10_000)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    assert r.start() is None
+    cid = _crash_after_post(w, rt)
+    r._safety_stop("test")
+    assert rt.store.get_order(cid).lifecycle is OrderLifecycle.CANCELED and rt.sm.state is BotState.STOPPED
+    assert not any(o.active for o in w.sim.all_orders())
+
+
+def test_shutdown_leaves_an_unfindable_order_unknown_for_the_next_start(tmp_path):
+    w = sim_world(tmp_path)
+    rt = w.runtime(hold_script)
+    r = AgentRunner(rt)
+    assert r.start() is None
+    cid = _crash_after_post(w, rt, stage="after_sending")    # persisted SENDING, never reached the exchange
+    posts = sum(w.sim.post_counts.values())
+    out = rt.engine.settle_for_shutdown("test")
+    assert sum(w.sim.post_counts.values()) == posts            # one lookup, never a re-send
+    assert out["still_unknown"] == [cid] and rt.store.get_order(cid).lifecycle is OrderLifecycle.UNKNOWN_OUTCOME
+    assert any(x["kind"] == "alert" and x["payload"].get("alert") == "unknown_at_shutdown"
+               for x in read_audit(rt.audit.path))
 
 
 # --------------------------------------------------------------------------- forced exits / late fills

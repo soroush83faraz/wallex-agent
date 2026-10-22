@@ -10,13 +10,18 @@ looked up again. ``<state>/live_canary.json`` records booleans/strings only (no 
 If the order fills anyway (a crossing market, a cancel race), the fill goes through the normal fill
 path into the live ledger, an ``alert`` is written, the result is ``ok: false``, and the operator is
 told exactly which holdings resulted.
+
+Interrupts (SIGINT/SIGTERM/SIGBREAK, via ``should_stop``): before the order is sent the canary is
+refused and nothing is sent; once it rests, the remaining observations are skipped and it is
+cancelled at once. Whatever happens after placement (even an exception), a ``finally`` cancels the
+canary order if it is still open (cancel only).
 """
 from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 from . import live_gate
 from .errors import OrderNotFound, WallexAgentError
@@ -57,9 +62,29 @@ def _lookup(ex: Any, oid: str) -> tuple[bool | None, Any, str | None]:
         return None, None, type(exc).__name__
 
 
-def run_canary(rt: Any, *, now: float | None = None) -> dict[str, Any]:
+def _ensure_cancelled(rt: Any, client_id: str) -> None:
+    """Safety net: the canary order must never be left resting (cancel only, best effort)."""
+    try:
+        rec = rt.store.get_order(client_id)
+        if rec is not None and rec.lifecycle in (L.OPEN, L.PARTIAL):
+            rec = rt.engine.cancel_and_verify(client_id)
+            if rec.lifecycle in (L.OPEN, L.PARTIAL):
+                rt.audit.write("alert", {"alert": "canary_still_open", "level": "critical", "client_id": client_id,
+                                         "reason": "cancel could not be verified: check the Wallex app"})
+    except Exception as exc:  # noqa: BLE001 - reported; the caller's error (if any) propagates
+        try:
+            rt.audit.write("alert", {"alert": "canary_cancel_failed", "level": "critical", "client_id": client_id,
+                                     "error": type(exc).__name__})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def run_canary(rt: Any, *, now: float | None = None,
+               should_stop: Callable[[], str | None] | None = None) -> dict[str, Any]:
     """Place, observe and cancel the canary order through ``rt.engine``; write ``live_canary.json``.
-    Raises ``CanaryRefused`` (nothing sent) when a precondition fails."""
+    Raises ``CanaryRefused`` (nothing sent) when a precondition fails or a stop was requested before
+    sending. ``should_stop()`` returns the reason of a pending interrupt (signal), or None."""
+    stop = should_stop or (lambda: None)
     cfg, ex, eng, store = rt.config, rt.exchange, rt.engine, rt.store
     usd = cfg.usdt_symbol
     audit = rt.audit
@@ -92,13 +117,15 @@ def run_canary(rt: Any, *, now: float | None = None) -> dict[str, Any]:
     audit.write("canary", {"stage": "plan", "symbol": usd, "price_fraction_of_bid": PRICE_FRACTION,
                            "price": price, "qty": qty})
     pre = (qb.value, qb.locked)
+    why = stop()
+    if why:
+        raise CanaryRefused(f"interrupted ({why}) before sending: nothing was sent")
 
     res = eng.submit(intent, decision_id="canary")
     obs: dict[str, Any] = {"submit_status": res.status, "submit_reason": res.reason[:200]}
     reasons: list[str] = []
     verified: list[str] = []
     rec = store.get_order(res.order_ids[-1]) if res.order_ids else None
-    rec_cid = rec.client_id if rec else None
     if rec is None or rec.lifecycle in (L.REJECTED, L.ABANDONED, L.UNKNOWN_OUTCOME, L.SENDING):
         reasons.append(f"order not placed/confirmed: submit status {res.status}"
                        + (f", lifecycle {rec.lifecycle.value}" if rec else ""))
@@ -106,7 +133,28 @@ def run_canary(rt: Any, *, now: float | None = None) -> dict[str, Any]:
                                "abandoned": "unknown_then_not_found", "unknown": "unknown_unresolved",
                                "stopped": "unknown_contradiction"}.get(res.status, res.status)
         return _finish(rt, ok=False, obs=obs, verified=verified, reasons=reasons, now=now)
+    try:
+        return _observe_and_cancel(rt, rec, ur, obs, reasons, verified, pre, stop, now)
+    finally:
+        _ensure_cancelled(rt, rec.client_id)      # never leave the canary resting (also on errors)
 
+
+def _observe_and_cancel(rt: Any, rec: Any, ur: Any, obs: dict[str, Any], reasons: list[str],
+                        verified: list[str], pre: tuple[Decimal, Decimal], stop: Callable[[], str | None],
+                        now: float | None) -> dict[str, Any]:
+    ex, eng, store = rt.exchange, rt.engine, rt.store
+    usd = rt.config.usdt_symbol
+    rec_cid = rec.client_id
+    why = stop()
+    if why:   # interrupted right after placement: skip every observation, cancel at once
+        reasons.append(f"interrupted ({why}) after placement: observations skipped, order cancelled at once")
+        obs["interrupted"] = why
+        if rec.lifecycle in (L.OPEN, L.PARTIAL):
+            rec = eng.cancel_and_verify(rec.client_id)
+        obs["final_lifecycle"] = rec.lifecycle.value
+        if rec.lifecycle in (L.OPEN, L.PARTIAL):
+            reasons.append("cancel could not be verified: the order may still be open (check `status`)")
+        return _finish(rt, ok=False, obs=obs, verified=verified, reasons=reasons, now=now)
     unknown_first = "POST outcome unknown" in (rec.note or "")
     obs["post_outcome"] = "unknown_then_adopted" if unknown_first else "acknowledged"
     obs["post_ack_parsed"] = not unknown_first
@@ -148,7 +196,11 @@ def run_canary(rt: Any, *, now: float | None = None) -> dict[str, Any]:
 
     # locked-balance semantics, from deltas around the placement (verdict only, no amounts)
     rec = store.get_order(rec.client_id)
-    if rec.lifecycle is L.OPEN and rec.executed_qty == 0:
+    why = stop()
+    if why:
+        reasons.append(f"interrupted ({why}): remaining observations skipped, order cancelled at once")
+        obs["interrupted"] = why
+    elif rec.lifecycle is L.OPEN and rec.executed_qty == 0:
         try:
             post = ex.get_balances().get(ur.quote)
             dv, dl = post.value - pre[0], post.locked - pre[1]

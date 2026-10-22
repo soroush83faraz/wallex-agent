@@ -8,8 +8,9 @@
 * ``build_cancel_only_runtime`` - for ``kill --cancel-open``: the client is wrapped in
   ``CancelOnlyExchange``, whose ``create_order`` refuses locally, so it can only read and cancel.
 
-Everything else that needs the key (``check-live``) gets ``read_only=True`` (no POST/DELETE possible).
-``tests/test_modes.py`` greps the source tree to keep it that way.
+Everything else that needs the key (``check-live``, ``unstop`` via ``build_unstop_runtime``) gets
+``read_only=True`` (no POST/DELETE possible). ``tests/test_modes.py`` greps the source tree to keep it
+that way.
 """
 from __future__ import annotations
 
@@ -149,21 +150,37 @@ def _live_runtime(cfg: Config, *, clock: Clock, transport: RecordingTransport, c
 def build_live(config: Config, *, flag_ack: bool, typed_phrase: str | None = None, resume: bool = False,
                input_fn: Callable[[str], str] | None = None, transport: Any = None,
                clock: Clock | None = None, now: float | None = None) -> Runtime:
-    """Gate first, then (and only then) the keyed client. ``resume`` (systemd, no TTY) takes the
-    phrase from ``<state>/LIVE_ARMED`` and accepts selftest/attestation evidence up to 48 h old when
-    this live store already started its competition; a fresh start always needs <= 24 h."""
+    """Gate first, then (and only then) the keyed client.
+
+    ``resume`` (systemd, no TTY) only CONTINUES a competition already started in this live store
+    (``runner.competition_start`` present): the first live start is always an operator at a terminal
+    typing the phrase. It takes the phrase from the structured ``<state>/LIVE_ARMED`` record, which
+    must match the current phrase, source tree, base URL and data dir and be unexpired, and it accepts
+    selftest/attestation evidence up to 48 h old; a fresh start always needs <= 24 h."""
     clk = clock or RealClock()
     cfg = replace(config, mode=Mode.LIVE)
+    t = float(now if now is not None else clk.now())
     phrase = typed_phrase
-    if resume and phrase is None:
-        phrase = live_gate.read_arming_phrase(cfg.state_path)
+    resuming = False
+    if resume:
+        if not competition_started(cfg):
+            raise LiveNotAllowedError(
+                f"--resume only CONTINUES a competition already started in {live_store_path(cfg)}; none is "
+                "started there. The first live start must be interactive: run `wallex-agent live "
+                "--i-understand-real-money` at a terminal and type the confirmation phrase.")
+        resuming = True
         if phrase is None:
-            raise LiveNotAllowedError(f"--resume needs the operator's arming file "
-                                      f"{cfg.state_path / live_gate.ARMING_FILE} (run `wallex-agent arm-live`)")
-    resuming = bool(resume and competition_started(cfg))
+            doc, why = live_gate.read_arming(cfg.state_path)
+            path = cfg.state_path / live_gate.ARMING_FILE
+            if doc is None:
+                raise LiveNotAllowedError(f"--resume needs a valid arming record {path} ({why}); run "
+                                          "`wallex-agent arm-live --i-understand-real-money` at a terminal")
+            problems = live_gate.arming_problems(doc, cfg, t)
+            if problems:
+                raise LiveNotAllowedError(f"--resume refused: {path}: " + "; ".join(problems))
+            phrase = str(doc["phrase"])
     gate = live_gate.check_live_allowed(
-        cfg, flag_ack=flag_ack, typed_phrase=phrase, now=now if now is not None else clk.now(),
-        input_fn=input_fn,
+        cfg, flag_ack=flag_ack, typed_phrase=phrase, now=t, input_fn=input_fn,
         max_evidence_age_s=live_gate.RESUME_MAX_EVIDENCE_AGE_S if resuming else live_gate.MAX_EVIDENCE_AGE_S)
     gate["resume"] = resuming
     tr = _transport(cfg, transport)
@@ -185,6 +202,30 @@ def build_canary_runtime(config: Config, *, flag_ack: bool, typed_phrase: str | 
     tr = _transport(cfg, transport)
     client = _keyed_write_client(cfg, tr, clk)
     return _live_runtime(cfg, clock=clk, transport=tr, client=client, gate=gate, label="live_canary")
+
+
+def build_unstop_runtime(config: Config, *, flag_ack: bool, input_fn: Callable[[str], str] | None = None,
+                         transport: Any = None, clock: Clock | None = None, now: float | None = None) -> Runtime:
+    """``unstop`` (live): the SAME gate evidence as ``live --resume`` (flag, ENABLE_LIVE, key, explicit
+    DATA_DIR, selftest, check-live, canary, no KILL, and the phrase: from a valid LIVE_ARMED record
+    when the competition has started, otherwise typed at a terminal) - but the exchange client is
+    READ-ONLY, so ``unstop`` can never place or cancel an order; it does not start trading."""
+    clk = clock or RealClock()
+    cfg = replace(config, mode=Mode.LIVE)
+    t = float(now if now is not None else clk.now())
+    started = competition_started(cfg)
+    phrase = None
+    if started:
+        doc, _ = live_gate.read_arming(cfg.state_path)
+        if doc is not None and not live_gate.arming_problems(doc, cfg, t):
+            phrase = str(doc["phrase"])
+    gate = live_gate.check_live_allowed(
+        cfg, flag_ack=flag_ack, typed_phrase=phrase, now=t, input_fn=input_fn,
+        max_evidence_age_s=live_gate.RESUME_MAX_EVIDENCE_AGE_S if started else live_gate.MAX_EVIDENCE_AGE_S)
+    gate["purpose"] = "unstop"
+    tr = _transport(cfg, transport)
+    client = read_only_client(cfg, transport=tr, clock=clk)
+    return _live_runtime(cfg, clock=clk, transport=tr, client=client, gate=gate, label="live_unstop")
 
 
 def build_cancel_only_runtime(config: Config, *, transport: Any = None,
