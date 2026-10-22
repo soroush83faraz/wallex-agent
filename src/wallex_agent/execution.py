@@ -28,12 +28,13 @@ from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .clock import Clock
 from .config import Config
 from .errors import ExchangeError, InvariantError, KillSwitchActive, OrderNotFound, RejectedError
 from .portfolio import Portfolio
+from .risk import RiskContext, RiskGate
 from .state import StateMachine, derive_state_explained
 from .store import FillRecord, OrderRecord
 from .types import (BPS, ONE, ORDER_TRANSITIONS, ZERO, Balance, BotState, MarketRules, OrderBook,
@@ -60,6 +61,7 @@ MAX_NOT_FOUND = 3
 MAX_ATTRIBUTED_KEPT = 5000
 QUARANTINE_MIN_CHECKS = 3          # absent re-checks (each >= unknown_resolve_window_s apart) to lift
 SHORTFALL_CONFIRM_S = 15.0         # a balance shortfall must persist this long (2nd check) to STOP
+StopCheck = Callable[[], "str | None"]   # returns why to stop now (shutdown, deadline), or None
 
 
 def drift_text(rr: Any) -> str:
@@ -147,7 +149,7 @@ class ExecutionResult:
 
 @dataclass
 class ConversionResult:
-    status: str     # done|already_funded|insufficient|nothing_to_convert|waiting|declined|blocked|stopped
+    status: str     # done|already_funded|insufficient|nothing_to_convert|waiting|declined|blocked|stopped|interrupted
     rounds: int = 0
     order_ids: list[str] = field(default_factory=list)
     tmn_spent: Decimal = ZERO
@@ -1165,27 +1167,45 @@ class ExecutionEngine:
     def _unresolved_on(self, symbol: str) -> bool:
         return any(o.symbol == symbol for o in self.store.unresolved_orders())
 
-    def _wait_for_orders(self, symbol: str) -> None:
+    def _wait_for_orders(self, symbol: str, should_stop: StopCheck | None = None) -> None:
         cfg = self.config
         step = max(1.0, cfg.order_timeout_s / 4)
         limit = cfg.order_timeout_s + cfg.unknown_resolve_window_s + 4 * step
         waited = 0.0
         self.poll_and_manage()
         while self._unresolved_on(symbol) and waited < limit and self.sm.state is not BotState.STOPPED:
+            if should_stop is not None and should_stop():
+                return                # the caller's shutdown cancels/settles whatever is still open
             self.clock.sleep(step)
             waited += step
             self.poll_and_manage()
 
-    def convert_tmn_to_usdt(self, *, max_rounds: int = 8) -> ConversionResult:
+    def _conversion_verdict(self, intent: TradeIntent, book: OrderBook, bals: Mapping[str, Balance]) -> Any:
+        """The SAME RiskGate check the runner applies to the agent's conversion decision (state, kill,
+        quarantine, rules, fee, book freshness/crossing, slippage cap, spread, depth within the cap,
+        rule violations, balance), re-run on fresh facts before EVERY conversion round."""
+        ctx = RiskContext(state=self.sm.state, balances=bals, fees=self._fees_cache, rules=self._rules_cache,
+                          books={intent.symbol: book}, now=self._now(), ledger=self.portfolio.expected_balances(),
+                          kill=self.kill_requested(), unresolved_orders=bool(self.store.unresolved_orders()),
+                          quarantined=self.quarantined())
+        return RiskGate(self.config, self.clock).evaluate(intent, ctx)
+
+    def convert_tmn_to_usdt(self, *, max_rounds: int = 8, decision_id: str | None = None,
+                            should_stop: StopCheck | None = None) -> ConversionResult:
         """Resumable UNFUNDED -> CONVERTING -> READY stage. Inspects ACTUAL balances (never assumes
         the funds are TMN or USDT), converts spendable TMN (bounded by the ledger) with aggressive
-        limits, cancels unfilled remainders and repeats until the residual is below the minimum."""
+        limits, cancels unfilled remainders and repeats until the residual is below the minimum.
+
+        Before EVERY round (not only the first, which the runner gated): ``should_stop()`` (a shutdown
+        request or the deadline: returns a reason) ends the stage, the kill switch raises
+        ``KillSwitchActive``, and the round must pass the same RiskGate check as the agent's decision
+        (a spread blow-out between rounds is never bought into). Orders carry ``decision_id``."""
         cfg = self.config
         usd, btc = cfg.usdt_symbol, cfg.btc_symbol
         out = ConversionResult(status="nothing_to_convert")
         self._assert_not_killed()
-        for _ in range(max_rounds):
-            self._wait_for_orders(usd)
+        for rnd in range(1, max_rounds + 1):
+            self._wait_for_orders(usd, should_stop)
             if self.sm.state is BotState.STOPPED:
                 out.status = "stopped"
                 return self._conversion_totals(out)
@@ -1196,6 +1216,12 @@ class ExecutionEngine:
                 out.status = "blocked"
                 out.notes.append(f"state {self.sm.state.value}")
                 return self._conversion_totals(out)
+            why_stop = should_stop() if should_stop is not None else None
+            if why_stop:
+                out.status = "interrupted"
+                out.notes.append(f"round {rnd} not sent: {why_stop}")
+                return self._conversion_totals(out)
+            self._assert_not_killed()
             try:
                 ur = self._rules(usd, refresh=True)
                 rate = self._fee_rate(usd, refresh=True)
@@ -1214,9 +1240,17 @@ class ExecutionEngine:
             if est_qty <= 0 or ur.violations(ur.round_price(ask, Side.BUY), est_qty):
                 out.notes.append(f"residual {ur.quote} {tmn} below conversion minimum")
                 break
-            res = self.submit(TradeIntent(purpose="convert", side=Side.BUY, symbol=usd, quantity=tmn / ask,
-                                          reference_price=ask, max_slippage_bps=cfg.conversion_slippage_bps,
-                                          note=f"{ur.quote}->{ur.base} conversion"))
+            intent = TradeIntent(purpose="convert", side=Side.BUY, symbol=usd, quantity=tmn / ask,
+                                 reference_price=ask, max_slippage_bps=cfg.conversion_slippage_bps,
+                                 note=f"{ur.quote}->{ur.base} conversion round {rnd}")
+            verdict = self._conversion_verdict(intent, book, bals)
+            if not verdict.approved:
+                out.status = "declined"
+                out.notes.append(f"round {rnd} refused by the risk gate: {'; '.join(verdict.reasons)[:300]}")
+                self._audit("conversion_round_refused", {"round": rnd, "reasons": verdict.reasons,
+                                                         "metrics": verdict.metrics, "decision_id": decision_id})
+                return self._conversion_totals(out)
+            res = self.submit(intent, decision_id)
             if res.order_ids:
                 out.rounds += 1
             out.order_ids.extend(res.order_ids)
@@ -1227,7 +1261,7 @@ class ExecutionEngine:
             if res.status in ("stopped", "unknown", "abandoned"):
                 out.status = res.status
                 return self._conversion_totals(out)
-        self._wait_for_orders(usd)
+        self._wait_for_orders(usd, should_stop)
         if self._unresolved_on(usd):
             out.status = "waiting"
             return self._conversion_totals(out)

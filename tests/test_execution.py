@@ -76,6 +76,63 @@ def test_conversion_inspects_actual_balances(tmp_path):
     assert w2.sm.state is S.UNFUNDED
 
 
+def test_conversion_round_after_a_spread_blowout_is_refused(tmp_path):
+    """L1 / R5: rounds 2..8 pass the same risk gate as the first: a gap between rounds is never
+    bought into."""
+    w = make_world(tmp_path)
+    w.sim.inject("partial_fill", frac=D("0.4"))
+    real_create = w.sim.create_order
+    posts = []
+
+    def create(req):
+        info = real_create(req)
+        posts.append(req)
+        if len(posts) == 1:                    # right after round 1 the USDTTMN asks gap up ~6.6 %
+            w.source.set_book(USD, [(D("271900"), D("100"))], [(D("290000"), D("1000"))])
+        return info
+
+    w.sim.create_order = create
+    res = w.engine.convert_tmn_to_usdt(decision_id="d-conv")
+    assert len(posts) == 1 and res.rounds == 1 and res.status == "declined"
+    assert any("round 2 refused by the risk gate" in n and "spread_too_wide" in n for n in res.notes)
+    assert w.audit.of("conversion_round_refused")[-1]["decision_id"] == "d-conv"
+    assert all(o.decision_id == "d-conv" for o in w.store.list_orders())       # F1: never null
+    assert w.ledger_matches_sim()
+
+
+def test_conversion_honours_the_stop_callback_before_every_round(tmp_path):
+    """L1: SIGINT/SIGTERM (or the deadline) between rounds: no further round is sent."""
+    w = make_world(tmp_path, order_timeout_s=5.0)
+    w.sim.inject("partial_fill", frac=D("0.4"))
+    asked = []
+
+    def should_stop():
+        asked.append(1)
+        done = [o for o in w.store.list_orders() if o.is_terminal]
+        return "shutdown requested (SIGTERM)" if done else None
+
+    res = w.engine.convert_tmn_to_usdt(should_stop=should_stop)
+    assert w.sim.order_count() == 1 and res.status == "interrupted" and asked
+    assert any("round 2 not sent: shutdown requested (SIGTERM)" in n for n in res.notes)
+    assert w.store.unresolved_orders() == []
+
+
+def test_conversion_checks_the_kill_switch_before_every_round(tmp_path):
+    w = make_world(tmp_path)
+    w.sim.inject("partial_fill", frac=D("0.4"))
+    real_create = w.sim.create_order
+
+    def create(req):
+        info = real_create(req)
+        (tmp_path / "KILL").write_text("x", encoding="utf-8")   # operator kills mid-conversion
+        return info
+
+    w.sim.create_order = create
+    with pytest.raises(KillSwitchActive):
+        w.engine.convert_tmn_to_usdt()
+    assert w.sim.order_count() == 1
+
+
 def test_conversion_declines_on_unknown_fee_or_stale_book(tmp_path):
     w = make_world(tmp_path)
     w.sim.hidden_fees.add(USD)

@@ -345,10 +345,12 @@ class AgentRunner:
         # a conversion stage interrupted after its last fill (crash/restart) is closed here: only a
         # residual below the market minimum is left, so no order can be sent and none is needed
         if self.sm.state is BotState.CONVERTING and not view.unknown and self._conversion_residual_only(view):
-            self.audit("tool_call", {"name": "engine.convert_tmn_to_usdt",
+            did = f"resume-convert-{self.cycle}"
+            self.audit("tool_call", {"name": "engine.convert_tmn_to_usdt", "decision_id": did,
                                      "reason": "resume/close the conversion stage (TMN residual below minimum)"})
-            cres = eng.convert_tmn_to_usdt()
-            self.audit("tool_call", {"name": "engine.convert_tmn_to_usdt", "status": cres.status,
+            # any round it might still send passes the same per-round risk gate and stop check
+            cres = eng.convert_tmn_to_usdt(decision_id=did, should_stop=self._conversion_stop_reason)
+            self.audit("tool_call", {"name": "engine.convert_tmn_to_usdt", "status": cres.status, "decision_id": did,
                                      "order_ids": cres.order_ids, "ok": cres.status in ("done", "already_funded")})
         # 5. forced exits, then the agent's decision (always recorded)
         ctx0 = self._risk_ctx(view)
@@ -524,7 +526,7 @@ class AgentRunner:
         self.audit("tool_call", {"decision_id": decision_id, "name": name, "intent": intent})
         try:
             if intent.purpose == "convert":
-                cres = eng.convert_tmn_to_usdt()
+                cres = eng.convert_tmn_to_usdt(decision_id=decision_id, should_stop=self._conversion_stop_reason)
                 result: dict[str, Any] = cres.to_dict()
                 ids, status, reason = list(cres.order_ids), cres.status, "; ".join(cres.notes)[-300:]
             else:
@@ -537,7 +539,7 @@ class AgentRunner:
             self.audit("tool_call", {"name": "engine.kill", "result": out})
             return "killed"
         self.audit("tool_call", {"decision_id": decision_id, "name": name, "ok": status not in
-                                 ("declined", "blocked", "rejected", "stopped"), "status": status,
+                                 ("declined", "blocked", "rejected", "stopped", "interrupted"), "status": status,
                                  "order_ids": ids, "reason": reason})
         # verify: re-read every order and the balances through the engine / exchange. A shortfall
         # blocks new orders at once and, confirmed on a later check, STOPS the bot (engine).
@@ -570,6 +572,15 @@ class AgentRunner:
             stop = self.store.kv_get("exec.stop") or {}
             self.reason = f"engine stopped the bot: {stop.get('reason') or self._last_stop_reason()}"
             return "stopped"
+        return None
+
+    def _conversion_stop_reason(self) -> str | None:
+        """Checked by the conversion stage before EVERY round: a signal (SIGINT/SIGTERM/SIGBREAK)
+        or the competition deadline ends it (the kill switch raises inside the engine)."""
+        if self.stop_requested:
+            return f"shutdown requested ({self._stop_requested})"
+        if self.deadline_ts is not None and float(self.clock.now()) >= self.deadline_ts:
+            return "competition deadline reached"
         return None
 
     def _mark_reported(self, ids: list[str]) -> None:

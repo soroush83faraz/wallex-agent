@@ -184,6 +184,25 @@ def test_stop_request_cancels_resting_orders_and_leaves_a_resumable_state(tmp_pa
     assert any("PARTIAL" in c for c in doc["honest_caveats"])
 
 
+def test_conversion_orders_carry_the_decision_id_and_the_stop_check(tmp_path):
+    """F1: the conversion order is linked to the CONVERT decision; L1: the runner hands the stage a
+    stop check covering signals and the deadline."""
+    w = sim_world(tmp_path)
+    rt = w.runtime(trader_script())
+    r = AgentRunner(rt)
+    assert r.start() is None
+    once(r)
+    conv = [o for o in rt.store.list_orders() if o.symbol == USD]
+    decided = [d.decision_id for d in rt.brain.decided if d.action is Action.CONVERT_TMN_USDT]
+    assert conv and decided and {o.decision_id for o in conv} == {decided[0]}
+    assert r._conversion_stop_reason() is None
+    r.request_stop("SIGTERM")
+    assert r._conversion_stop_reason() == "shutdown requested (SIGTERM)"
+    r2 = AgentRunner(rt)
+    r2.deadline_ts = w.clock.now() - 1
+    assert r2._conversion_stop_reason() == "competition deadline reached"
+
+
 def test_stage_convert_runs_only_the_conversion_and_stops_at_ready(tmp_path):
     w = sim_world(tmp_path)
     rt = w.runtime(trader_script(buy_every=1))     # would buy immediately if allowed
