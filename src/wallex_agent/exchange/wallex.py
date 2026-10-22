@@ -710,8 +710,12 @@ class WallexClient:
         failure: str | None = None
         result: Any = None
         try:
-            result = self._transport.request(prep.method, prep.url, prep.headers, prep.body,
-                                             self._timeout)
+            # /v1/markets is ~450 KB: give it more time (slow proxies); everything else keeps the
+            # configured timeout, and writes are never lengthened (unknown-outcome handling).
+            timeout = self._timeout
+            if not prep.route.write and prep.path == "/v1/markets":
+                timeout = max(timeout, 45.0)
+            result = self._transport.request(prep.method, prep.url, prep.headers, prep.body, timeout)
         except Exception as exc:  # noqa: BLE001 - for a write every failure is "outcome unknown"
             failure = f"{type(exc).__name__}: {_safe_str(exc)}"     # scrubbed in full below
         if failure is not None:

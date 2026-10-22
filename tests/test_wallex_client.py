@@ -1512,3 +1512,13 @@ def test_client_end_to_end_through_urllib_transport_with_fake_opener():
     sent, timeout = opener.requests[0]
     assert sent.full_url == "https://api.wallex.ir/v1/account/balances" and timeout == 10.0
     assert sent.get_header("X-api-key") == KEY
+
+
+def test_markets_read_gets_a_longer_timeout_but_other_calls_keep_theirs():
+    c, t, _ = make((200, {}, fixture_bytes("markets_real_2026-10-22.json")), ok({"ask": [], "bid": []}),
+                   timeout=10.0)
+    c.get_markets()
+    assert t.calls[0]["timeout"] >= 45.0
+    with pytest.raises(Exception):
+        c.get_order_book("BTCUSDT")          # empty book is a SchemaError; only the timeout matters here
+    assert t.calls[1]["timeout"] == 10.0
