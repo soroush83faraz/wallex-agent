@@ -10,13 +10,13 @@ and backtests exercise exactly the same SQL, constraints and transaction semanti
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
 import sqlite3
 import threading
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 from decimal import Decimal
@@ -30,10 +30,22 @@ from .interfaces import Event
 from .types import (ORDER_TRANSITIONS, TERMINAL_LIFECYCLES, UNRESOLVED_LIFECYCLES, ZERO,
                     OrderLifecycle, Side)
 
+try:                      # POSIX
+    import fcntl as _fcntl
+except ImportError:       # pragma: no cover - Windows
+    _fcntl = None         # type: ignore[assignment]
+try:                      # Windows
+    import msvcrt as _msvcrt
+except ImportError:       # pragma: no cover - POSIX
+    _msvcrt = None        # type: ignore[assignment]
+
 LOCK_FILENAME = "instance.lock"
 SCHEMA_VERSION = 1
 FEE_SOURCES = ("exchange", "estimated")
-_UNPARSABLE_LOCK_GRACE_S = 60.0   # a writer fills the lock file within microseconds of creating it
+# Windows byte-range locks are MANDATORY (a locked byte cannot even be read by others), so the lock
+# covers one byte far beyond the informational JSON at offset 0, which therefore stays readable.
+# Locking beyond the end of a file is allowed on Windows; POSIX flock() locks the whole file.
+_WIN_LOCK_OFFSET = 1 << 30
 
 
 class StoreError(WallexAgentError):
@@ -278,17 +290,81 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-class InstanceLock:
-    """``<dir>/instance.lock`` holding ``{pid, host, token, created}``.
+def _os_try_lock(fd: int) -> bool:
+    """Non-blocking EXCLUSIVE OS lock on ``fd``: True if acquired, False if another open file
+    (another process, or another handle in this process) holds it. The kernel drops the lock when
+    the holder closes the file or dies, so there is no staleness to guess about."""
+    if _fcntl is not None:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                return False
+            raise InstanceLockError(f"flock failed: {exc.strerror or exc}") from exc
+        return True
+    if _msvcrt is not None:
+        os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+        try:
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK), errno.EDEADLK):
+                return False
+            raise InstanceLockError(f"msvcrt.locking failed: {exc.strerror or exc}") from exc
+        return True
+    raise InstanceLockError("no OS file-locking primitive (fcntl/msvcrt) is available: refusing to run "
+                            "without a single-instance lock")
 
-    Created with O_EXCL (atomic on Windows and POSIX). A lock whose PID is dead on this host is
-    stale and reclaimed; a lock from another host or an unreadable fresh lock is never stolen.
-    The file descriptor stays open while held (on Windows this also blocks deletion by others).
+
+def _os_unlock(fd: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+    elif _msvcrt is not None:
+        os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+
+
+def read_lock_info(path: str | Path) -> dict[str, Any] | None:
+    """The informational JSON of a lock file (``pid``, ``host``, ``started``) or None. Never use it
+    to decide liveness: only the OS lock does that (see ``probe_lock``)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def probe_lock(directory: str | Path) -> bool | None:
+    """Is ``<directory>/instance.lock`` held right now? ``None``: no lock file (no store ever opened
+    there); ``True``: held (an agent is running on that store); ``False``: free. Creates nothing."""
+    path = Path(directory) / LOCK_FILENAME
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except FileNotFoundError:
+        return None
+    try:
+        if not _os_try_lock(fd):
+            return True
+        try:
+            _os_unlock(fd)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+
+
+class InstanceLock:
+    """``<dir>/instance.lock``: an OS advisory lock held for the whole life of the owning store.
+
+    POSIX ``flock(LOCK_EX|LOCK_NB)`` / Windows ``msvcrt.locking(LK_NBLCK)`` on one fixed byte. The
+    lock FILE is never deleted or renamed (so no race can move a fresh lock away), and the kernel
+    releases the lock when the holder dies, so there is no PID/staleness heuristic at all. The
+    file's JSON (pid, host, start time) is informational only. A second store on the same directory
+    - in another process or in this one - is refused with ``InstanceLockError``.
     """
 
     def __init__(self, directory: str | Path) -> None:
         self.path = Path(directory) / LOCK_FILENAME
-        self.token = uuid.uuid4().hex
         self._fd: int | None = None
 
     @property
@@ -299,81 +375,46 @@ class InstanceLock:
         if self._fd is not None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        for _ in range(3):
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
-            except FileExistsError:
-                self._reclaim_if_stale()
-                continue
-            body = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "token": self.token,
-                               "created": time.time()}).encode("utf-8")
-            try:
-                os.write(fd, body)
-                os.fsync(fd)
-            except BaseException:
-                os.close(fd)
-                self.path.unlink(missing_ok=True)
-                raise
-            self._fd = fd
-            return
-        raise InstanceLockError(f"could not acquire {self.path} (contended)")
-
-    def _read(self, path: Path) -> dict[str, Any] | None:
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+            locked = _os_try_lock(fd)
+        except BaseException:
+            os.close(fd)
             raise
-        except (OSError, ValueError):
-            return None
-        return data if isinstance(data, dict) and isinstance(data.get("pid"), int) else None
-
-    def _reclaim_if_stale(self) -> None:
-        try:
-            info = self._read(self.path)
-            mtime = self.path.stat().st_mtime
-        except FileNotFoundError:
-            return  # released meanwhile: retry create
-        if info is None:
-            if time.time() - mtime < _UNPARSABLE_LOCK_GRACE_S:
-                raise InstanceLockError(f"{self.path} exists and is being written/unreadable")
-        else:
-            if info.get("host") != socket.gethostname():
-                raise InstanceLockError(
-                    f"{self.path} held by pid {info['pid']} on host {info.get('host')!r}; "
-                    "cannot verify liveness - remove the file manually if that host is down")
-            if pid_alive(info["pid"]):
-                same = " (this process)" if info["pid"] == os.getpid() else ""
-                raise InstanceLockError(
-                    f"another instance is running: pid {info['pid']}{same} holds {self.path}")
-        # Stale. Move it aside first so two reclaimers cannot both delete a fresh lock.
-        aside = self.path.with_name(f"{LOCK_FILENAME}.stale-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-        try:
-            os.rename(self.path, aside)
-        except FileNotFoundError:
-            return
-        except PermissionError as exc:   # Windows: the holder still has it open => alive
-            raise InstanceLockError(f"{self.path} is held open by another process") from exc
-        try:
-            moved = self._read(aside)
-        except FileNotFoundError:
-            moved = None
-        if info is not None and (moved is None or moved.get("token") != info.get("token")):
-            raise InstanceLockError(f"{self.path} changed during stale-lock reclaim; retry")
-        aside.unlink(missing_ok=True)
+        if not locked:
+            os.close(fd)
+            info = read_lock_info(self.path) or {}
+            who = (f" (pid {info.get('pid')} on host {info.get('host')!r} according to the file)"
+                   if info.get("pid") is not None else "")
+            raise InstanceLockError(f"another instance is running: {self.path} is locked{who}")
+        try:   # informational content; written only while holding the lock, never truncated by others
+            body = json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "started": time.time(),
+                               "note": "informational; liveness is the OS lock, not this text"}
+                              ).encode("utf-8")
+            os.lseek(fd, 0, os.SEEK_SET)
+            view = memoryview(body)
+            while view:
+                view = view[os.write(fd, view):]
+            os.ftruncate(fd, len(body))
+            os.fsync(fd)
+        except BaseException:
+            try:
+                _os_unlock(fd)
+            finally:
+                os.close(fd)
+            raise
+        self._fd = fd
 
     def release(self) -> None:
         if self._fd is None:
             return
         fd, self._fd = self._fd, None
         try:
-            os.close(fd)
+            _os_unlock(fd)
+        except OSError:
+            pass                 # closing the descriptor releases it anyway
         finally:
-            try:
-                info = self._read(self.path)
-            except FileNotFoundError:
-                info = None
-            if info is not None and info.get("token") == self.token:
-                self.path.unlink(missing_ok=True)
+            os.close(fd)
 
 
 # --------------------------------------------------------------------------- store
