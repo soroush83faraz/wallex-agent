@@ -36,6 +36,7 @@ class Config:
     api_base: str = "https://api.wallex.ir"
     api_key: str = field(default="", repr=False)   # secret: never logged / reported
     enable_live: bool = False
+    use_env_proxy: bool = False                     # honour HTTP(S)_PROXY (changes source IP!)
 
     # ---- competition
     initial_tmn: Decimal = Decimal("5000000")
@@ -135,6 +136,7 @@ _ENV: dict[str, tuple[str, Any]] = {
     "FINAL_POLICY": ("final_policy", lambda v: v.strip().lower()),
     "DATA_DIR": ("data_dir", str),
     "API_BASE": ("api_base", str),
+    "WALLEX_USE_ENV_PROXY": ("use_env_proxy", _b),
     "PAPER_FEE_RATE": ("paper_fee_rate", dec),
     "STOP_LOSS_PCT": ("stop_loss_pct", dec),
     "MAX_DRAWDOWN_PCT": ("max_drawdown_pct", dec),
