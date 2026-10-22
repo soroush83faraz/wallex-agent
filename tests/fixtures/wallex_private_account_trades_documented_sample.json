@@ -1,0 +1,20 @@
+{
+  "_fixture": "DOCUMENTED SAMPLE, not a live capture. GET /v1/account/trades from docs/wallex_official_api_reference_snapshot_2026-10-22.txt (the '...' continuation removed). Buy fill: fee charged in the BASE asset (PAXG).",
+  "success": true,
+  "message": "عملیات با موفقیت انجام شد",
+  "result": {
+    "AccountLatestTrades": [
+      {
+        "symbol": "PAXGTMN",
+        "quantity": "0.0032340000000000",
+        "price": "61133333.0000000000000000",
+        "sum": "197705.1989220000000000",
+        "fee": "0.0000097020000000",
+        "feeCoefficient": "0.0030000000000000",
+        "feeAsset": "PAXG",
+        "isBuyer": true,
+        "timestamp": "2022-06-18T17:22:25Z"
+      }
+    ]
+  }
+}
