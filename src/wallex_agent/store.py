@@ -341,9 +341,14 @@ def probe_lock(directory: str | Path) -> bool | None:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
         return None
+    except OSError:
+        return True          # exists but not ours to open (another user): assume in use (fail closed)
     try:
-        if not _os_try_lock(fd):
-            return True
+        try:
+            if not _os_try_lock(fd):
+                return True
+        except InstanceLockError:
+            return True      # cannot tell: assume in use (fail closed)
         try:
             _os_unlock(fd)
         except OSError:
