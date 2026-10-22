@@ -1,0 +1,104 @@
+# /etc/systemd/system/wallex-agent.service
+#
+# Wallex agent, LIVE mode on a VPS. Paths marked PLACEHOLDER must match your install.
+#
+# Install (as root):
+#   useradd --system --home /var/lib/wallex-agent --shell /usr/sbin/nologin wallex-agent
+#   install -d -m 0750 -o root -g wallex-agent /etc/wallex-agent
+#   install -m 0640 -o root -g wallex-agent .env /etc/wallex-agent/wallex-agent.env
+#       (WALLEX_API_KEY, TRADING_MODE=live, ENABLE_LIVE=true, INITIAL_TMN, and
+#        DATA_DIR=/var/lib/wallex-agent/state. Key WITHOUT withdrawal permission,
+#        IP allow-listed to this VPS)
+#   systemctl daemon-reload && systemctl enable wallex-agent
+#
+# FIRST START IS NEVER DONE BY SYSTEMD. The operator first runs, interactively, as the
+# wallex-agent user: `wallex-agent selftest`, `wallex-agent check-live`, then
+# `wallex-agent live --i-understand-real-money` (types `START LIVE <initial_tmn>` at the TTY).
+# All live gates are listed in src/wallex_agent/live_gate.py.
+#
+# ARMING: this unit only starts when the operator has created the arming file
+#   /var/lib/wallex-agent/state/LIVE_ARMED   (content: START LIVE <initial_tmn>)
+# (ConditionPathExists below). Without it, `systemctl start` and boot-time start are
+# silently skipped, so a reboot can never start live trading by accident. Delete the file
+# to disarm. A KILL file in the state dir also stops systemd from (re)starting the service,
+# and the bot checks it before every order.
+#
+# WHY A RESTART IS SAFE (Restart=on-failure):
+#   * persist-before-send: each order intent is committed to SQLite (INTENT -> SENDING, with
+#     a balance snapshot) BEFORE the single POST, and a client_id is never POSTed twice.
+#   * on start, `live --resume` runs ExecutionEngine.reconcile_startup(): it resolves every
+#     unresolved/unknown-outcome order from exchange facts (order lookups, open orders, trades,
+#     balance delta), rebuilds the ledger from recorded fills, compares it with the real
+#     balances and goes STOPPED (no trading) on unexplained drift.
+#   * the audit log resumes its hash chain, and the competition start time is persisted,
+#     so a restart neither duplicates orders nor resets the 24 h window.
+#   The resume path still re-checks the live gates (fresh selftest/attestation for THIS
+#   source tree, no KILL file). If a gate fails, the service exits and stays down
+#   (StartLimitBurst). It never trades on a failed gate.
+
+[Unit]
+Description=Wallex agent (BTC/USDT spot, LIVE under strict gates)
+After=network-online.target time-sync.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/wallex-agent/state/LIVE_ARMED
+ConditionPathExists=!/var/lib/wallex-agent/state/KILL
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=wallex-agent
+Group=wallex-agent
+# PLACEHOLDER install dir and virtualenv
+WorkingDirectory=/opt/wallex-agent
+EnvironmentFile=/etc/wallex-agent/wallex-agent.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# PLACEHOLDER: final CLI flags are owned by cli.py. `--resume` must not prompt (no TTY here).
+# It takes the confirmation from the operator-created LIVE_ARMED file, then runs reconcile_startup.
+ExecStart=/opt/wallex-agent/.venv/bin/wallex-agent live --resume --i-understand-real-money
+Restart=on-failure
+RestartSec=30
+# PLACEHOLDER: add the CLI's "live gate refused" / "kill switch" exit codes here, so systemd
+# does not keep retrying something that only an operator can fix, e.g.:
+# RestartPreventExitStatus=3 4
+KillSignal=SIGINT
+TimeoutStopSec=60
+KillMode=mixed
+
+# ---- state: the only writable place
+StateDirectory=wallex-agent
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/wallex-agent
+UMask=0077
+
+# ---- hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# CPython without a JIT does not need writable+executable memory
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# no core dumps: a dump of this process would contain the API key
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
