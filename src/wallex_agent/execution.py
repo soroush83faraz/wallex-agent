@@ -595,7 +595,8 @@ class ExecutionEngine:
             self._maybe_crash("after_post")
             self.store.update_order(cid, lifecycle=L.UNKNOWN_OUTCOME,
                                     note=f"POST outcome unknown: {type(exc).__name__}: {str(exc)[:160]}")
-            self._alert("unknown_outcome", {"client_id": cid, "error": type(exc).__name__})
+            self._alert("unknown_outcome", {"client_id": cid, "error": type(exc).__name__,
+                                              "message": str(exc)[:200]})   # client scrubs secrets
             self.resolve_unknown(self.store.get_order(cid))
             return "resolved", self.store.get_order(cid), None
         self._maybe_crash("after_post")
