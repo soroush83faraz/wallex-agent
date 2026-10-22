@@ -142,7 +142,7 @@ def live_cfg(tmp_path, **kw):
 
 
 def ok_runner(argv, cwd):
-    return 0, "12 passed in 0.5s\n"
+    return 0, f"{lg.MIN_SELFTEST_TESTS + 100} passed in 0.5s\n"
 
 
 def evidence(tmp_path, *, age_h=1.0):

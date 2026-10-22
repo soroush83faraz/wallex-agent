@@ -149,21 +149,37 @@ def _live_runtime(cfg: Config, *, clock: Clock, transport: RecordingTransport, c
 def build_live(config: Config, *, flag_ack: bool, typed_phrase: str | None = None, resume: bool = False,
                input_fn: Callable[[str], str] | None = None, transport: Any = None,
                clock: Clock | None = None, now: float | None = None) -> Runtime:
-    """Gate first, then (and only then) the keyed client. ``resume`` (systemd, no TTY) takes the
-    phrase from ``<state>/LIVE_ARMED`` and accepts selftest/attestation evidence up to 48 h old when
-    this live store already started its competition; a fresh start always needs <= 24 h."""
+    """Gate first, then (and only then) the keyed client.
+
+    ``resume`` (systemd, no TTY) only CONTINUES a competition already started in this live store
+    (``runner.competition_start`` present): the first live start is always an operator at a terminal
+    typing the phrase. It takes the phrase from the structured ``<state>/LIVE_ARMED`` record, which
+    must match the current phrase, source tree, base URL and data dir and be unexpired, and it accepts
+    selftest/attestation evidence up to 48 h old; a fresh start always needs <= 24 h."""
     clk = clock or RealClock()
     cfg = replace(config, mode=Mode.LIVE)
+    t = float(now if now is not None else clk.now())
     phrase = typed_phrase
-    if resume and phrase is None:
-        phrase = live_gate.read_arming_phrase(cfg.state_path)
+    resuming = False
+    if resume:
+        if not competition_started(cfg):
+            raise LiveNotAllowedError(
+                f"--resume only CONTINUES a competition already started in {live_store_path(cfg)}; none is "
+                "started there. The first live start must be interactive: run `wallex-agent live "
+                "--i-understand-real-money` at a terminal and type the confirmation phrase.")
+        resuming = True
         if phrase is None:
-            raise LiveNotAllowedError(f"--resume needs the operator's arming file "
-                                      f"{cfg.state_path / live_gate.ARMING_FILE} (run `wallex-agent arm-live`)")
-    resuming = bool(resume and competition_started(cfg))
+            doc, why = live_gate.read_arming(cfg.state_path)
+            path = cfg.state_path / live_gate.ARMING_FILE
+            if doc is None:
+                raise LiveNotAllowedError(f"--resume needs a valid arming record {path} ({why}); run "
+                                          "`wallex-agent arm-live --i-understand-real-money` at a terminal")
+            problems = live_gate.arming_problems(doc, cfg, t)
+            if problems:
+                raise LiveNotAllowedError(f"--resume refused: {path}: " + "; ".join(problems))
+            phrase = str(doc["phrase"])
     gate = live_gate.check_live_allowed(
-        cfg, flag_ack=flag_ack, typed_phrase=phrase, now=now if now is not None else clk.now(),
-        input_fn=input_fn,
+        cfg, flag_ack=flag_ack, typed_phrase=phrase, now=t, input_fn=input_fn,
         max_evidence_age_s=live_gate.RESUME_MAX_EVIDENCE_AGE_S if resuming else live_gate.MAX_EVIDENCE_AGE_S)
     gate["resume"] = resuming
     tr = _transport(cfg, transport)

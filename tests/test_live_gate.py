@@ -24,8 +24,11 @@ def iso(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+FULL = lg.MIN_SELFTEST_TESTS + 241          # a full-suite-sized run
+
+
 def ok_runner(argv, cwd):
-    return 0, "........\n12 passed in 0.50s\n"
+    return 0, f"........\n{FULL} passed in 0.50s\n"
 
 
 def probe_report(**kw):
@@ -108,6 +111,8 @@ def _break(case, cfg, sdir):
         edit_json(st, passed=False, reason="1 failing test(s)")
     elif case == "selftest_fresh":
         edit_json(st, at=iso(NOW - 24 * 3600 - 1))
+    elif case == "selftest_test_count":
+        edit_json(st, counts={"passed": 12})
     elif case == "selftest_source_hash":
         edit_json(st, source_hash="0" * 64)
     elif case == "schema_attestation_present":
@@ -128,7 +133,7 @@ def _break(case, cfg, sdir):
 
 
 CASES = ["mode_live", "enable_live", "flag_ack", "api_key_set", "data_dir_explicit", "no_kill_file",
-         "selftest_present",
+         "selftest_present", "selftest_test_count",
          "selftest_passed", "selftest_fresh", "selftest_source_hash", "schema_attestation_present",
          "schema_attestation_ok", "schema_attestation_fresh", "schema_attestation_base_url",
          "schema_attestation_source_hash", "typed_phrase"]
@@ -241,9 +246,10 @@ def test_source_hash_properties(tmp_path):
         p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
     (b / "__pycache__").mkdir(exist_ok=True)
     (b / "__pycache__" / "junk.py").write_text("x = 1\n", encoding="utf-8")
-    (b / "notes.txt").write_text("not python\n", encoding="utf-8")
+    (b / "exchange" / "__pycache__").mkdir(exist_ok=True)
+    (b / "exchange" / "__pycache__" / "x.cpython-312.pyc").write_bytes(b"\0compiled")
     h = lg.source_hash(a)
-    assert h == lg.source_hash(b) and len(h) == 64
+    assert h == lg.source_hash(b) and len(h) == 64   # CRLF and __pycache__ do not count
     (a / "types.py").rename(a / "types2.py")
     assert lg.source_hash(a) != h                  # renames count
     (a / "types2.py").rename(a / "types.py")
@@ -252,29 +258,70 @@ def test_source_hash_properties(tmp_path):
     assert lg.source_hash(a) != h                  # additions count (even empty files)
 
 
+@pytest.mark.parametrize("name,data", [("notes.txt", b"data\n"), ("rules.json", b'{"x": 1}'),
+                                       ("_speedups.pyd", b"MZ\0\0binary"), ("fast.so", b"\x7fELF\0\0"),
+                                       ("sub/extra.dat", b"\0\1\2")])
+def test_source_hash_covers_every_package_file_not_only_py(tmp_path, name, data):
+    """M1(c): a native extension or a data file next to the code can change behaviour too."""
+    a = _copy_pkg(tmp_path)
+    h = lg.source_hash(a)
+    (a / name).parent.mkdir(parents=True, exist_ok=True)
+    (a / name).write_bytes(data)
+    assert lg.source_hash(a) != h
+
+
+def test_binary_files_are_not_crlf_normalised(tmp_path):
+    a = _copy_pkg(tmp_path / "a")
+    (a / "x.pyd").write_bytes(b"\0\r\n")
+    h = lg.source_hash(a)
+    (a / "x.pyd").write_bytes(b"\0\n")
+    assert lg.source_hash(a) != h
+
+
+def test_source_hash_covers_pyproject_and_tests(tmp_path):
+    pkg = _copy_pkg(tmp_path)
+    root = tmp_path / "repo"
+    h0 = lg.source_hash(pkg)
+    (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\naddopts='-q'\n", encoding="utf-8")
+    h1 = lg.source_hash(pkg)
+    (root / "tests" / "conftest.py").write_text("import pytest\n", encoding="utf-8")
+    h2 = lg.source_hash(pkg)
+    (root / "tests" / "sub").mkdir()
+    (root / "tests" / "sub" / "test_x.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+    h3 = lg.source_hash(pkg)
+    (root / "tests" / "fixture.json").write_text("{}", encoding="utf-8")       # tests: *.py only
+    assert len({h0, h1, h2, h3}) == 4 and lg.source_hash(pkg) == h3
+    labels = [label for label, _ in lg.source_files(pkg)]
+    assert "project/pyproject.toml" in labels and "project/tests/conftest.py" in labels
+    assert "project/tests/sub/test_x.py" in labels
+    # the real checkout: its own tests are covered
+    real = [label for label, _ in lg.source_files()]
+    assert "project/tests/test_live_gate.py" in real and "project/pyproject.toml" in real
+
+
 # --------------------------------------------------------------------------- selftest
 def test_run_selftest_writes_attestation(tmp_path):
     seen = []
 
     def runner(argv, cwd):
         seen.append((list(argv), cwd))
-        return 0, "............\n=== 12 passed, 2 skipped in 0.50s ===\n"
+        return 0, f"............\n=== {FULL} passed, 2 skipped in 0.50s ===\n"
 
     res = lg.run_selftest(tmp_path, runner=runner, clock=SimClock(NOW))
     argv, cwd = seen[0]
     assert argv[1:4] == ["-m", "pytest", "-q"] and Path(cwd) == lg.project_root()
     doc = json.loads((tmp_path / lg.SELFTEST_FILE).read_text(encoding="utf-8"))
     assert doc == res
-    assert doc["passed"] is True and doc["tests"] == 14 and doc["failures"] == 0
+    assert doc["passed"] is True and doc["tests"] == FULL + 2 and doc["failures"] == 0
     assert doc["source_hash"] == lg.source_hash() and doc["at"] == iso(NOW)
     assert set(doc) >= {"passed", "tests", "failures", "source_hash", "at", "python", "duration_s"}
     assert [p.name for p in tmp_path.iterdir()] == [lg.SELFTEST_FILE]    # no temp files left
 
 
 @pytest.mark.parametrize("rc,out,failures", [
-    (1, "F.....\n1 failed, 11 passed in 1.00s\n", 1),
-    (1, "E\n11 passed, 2 errors in 1.00s\n", 2),
-    (0, "11 passed in 1.00s\n", 0),          # rc lies? no: passes
+    (1, f"F.....\n1 failed, {FULL} passed in 1.00s\n", 1),
+    (1, f"E\n{FULL} passed, 2 errors in 1.00s\n", 2),
+    (0, f"{FULL} passed in 1.00s\n", 0),          # rc lies? no: passes
     (5, "no tests ran in 0.01s\n", 0),
     (0, "garbage without a summary\n", 0),
 ])
@@ -284,6 +331,42 @@ def test_run_selftest_failure_modes(tmp_path, rc, out, failures):
     assert res["passed"] is (rc == 0 and failures == 0 and "passed" in out)
     if not res["passed"]:
         assert res["reason"]
+
+
+@pytest.mark.parametrize("n", [1, 12, lg.MIN_SELFTEST_TESTS - 1])
+def test_a_partial_test_run_attests_nothing(tmp_path, n):
+    """M1(d): `-k`/PYTEST_ADDOPTS or a trimmed tests dir must not produce a passing selftest."""
+    res = lg.run_selftest(tmp_path, runner=lambda a, c: (0, f"{n} passed in 0.1s\n"), clock=SimClock(NOW))
+    assert res["passed"] is False and "not the project's full suite" in res["reason"]
+    res = lg.run_selftest(tmp_path, runner=lambda a, c: (0, f"{lg.MIN_SELFTEST_TESTS} passed in 1s\n"),
+                          clock=SimClock(NOW))
+    assert res["passed"] is True
+
+
+def test_selftest_subprocess_gets_a_scrubbed_environment(monkeypatch):
+    """M1(d): the test run never sees the key, the live switches, the data dir or proxies."""
+    dirty = {"PATH": "/usr/bin", "SYSTEMROOT": "C:\\Windows", "TEMP": "/tmp", "LC_ALL": "C.UTF-8",
+             "WALLEX_API_KEY": SENTINEL_KEY, "MY_EXCHANGE_SECRET_TOKEN": "tok", "DATA_DIR": "/var/lib/x",
+             "ENABLE_LIVE": "true", "TRADING_MODE": "live", "PROFILE": "competition", "INITIAL_TMN": "1",
+             "HTTPS_PROXY": "http://proxy:3128", "http_proxy": "http://p", "NO_PROXY": "*",
+             "WALLEX_USE_ENV_PROXY": "true", "PYTEST_ADDOPTS": "-k nothing", "PYTHONPATH": "/evil",
+             "PYTHONSTARTUP": "/evil.py", "API_BASE": "https://evil.test"}
+    env = lg.selftest_env(dirty, "/repo/src")
+    assert env == {"PATH": "/usr/bin", "SYSTEMROOT": "C:\\Windows", "TEMP": "/tmp", "LC_ALL": "C.UTF-8",
+                   "PYTHONPATH": "/repo/src"}
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        return lg.subprocess.CompletedProcess(argv, 0, f"{FULL} passed in 1s\n", "")
+    monkeypatch.setattr(lg.subprocess, "run", fake_run)
+    for k, v in dirty.items():
+        monkeypatch.setenv(k, v)
+    rc, out = lg._default_runner(["python", "-m", "pytest"], Path("/repo"))
+    assert rc == 0 and SENTINEL_KEY not in json.dumps(seen["env"])
+    assert not {"WALLEX_API_KEY", "DATA_DIR", "ENABLE_LIVE", "TRADING_MODE", "HTTPS_PROXY",
+                "PYTEST_ADDOPTS"} & set(seen["env"])
+    assert seen["env"]["PYTHONPATH"] == str(Path("/repo") / "src")
 
 
 def test_run_selftest_prefers_junit_counts(tmp_path):
@@ -374,10 +457,42 @@ def test_phrase_reader_eof_is_refusal(tmp_path):
         lg.read_typed_phrase(live_config(tmp_path), input_fn=eof)
 
 
-def test_arming_phrase_file(tmp_path):
-    assert lg.read_arming_phrase(tmp_path) is None
-    (tmp_path / lg.ARMING_FILE).write_text(PHRASE + "\r\n", encoding="utf-8")
-    assert lg.read_arming_phrase(tmp_path) == PHRASE
+def test_arming_record_is_structured_and_bound(tmp_path):
+    """M1(b): LIVE_ARMED binds the phrase, source tree, base URL, data dir and an expiry."""
+    cfg = live_config(tmp_path, competition_hours=24.0)
+    assert lg.read_arming(tmp_path) == (None, "missing")
+    (tmp_path / lg.ARMING_FILE).write_text(PHRASE + "\r\n", encoding="utf-8")      # legacy / hand-written
+    doc, why = lg.read_arming(tmp_path)
+    assert doc is None and "not a structured arming record" in why
+    doc = lg.write_arming(cfg, now=NOW)
+    assert lg.read_arming(tmp_path) == (doc, None)
+    assert doc["phrase"] == PHRASE and doc["source_hash"] == lg.source_hash() and doc["base_url"] == BASE
+    assert doc["armed_at"] == iso(NOW) and doc["expires_at"] == iso(NOW + 24 * 3600 + lg.ARMING_GRACE_S)
+    assert lg.arming_problems(doc, cfg, NOW + 3600) == []
+    assert SENTINEL_KEY not in json.dumps(doc)
+
+
+@pytest.mark.parametrize("change,why", [
+    ({"phrase": "START LIVE 6000000"}, "phrase"), ({"initial_tmn": "6000000"}, "initial_tmn"),
+    ({"source_hash": "0" * 64}, "source_hash"), ({"base_url": "https://evil.test"}, "base_url"),
+    ({"data_dir": "/elsewhere"}, "DATA_DIR"), ({"version": 0}, "version"),
+    ({"armed_at": "yesterday"}, "armed_at"), ({"expires_at": iso(NOW + 30 * 24 * 3600)}, "longer"),
+    ({"armed_at": iso(NOW + 3600)}, "future"),
+])
+def test_arming_record_problems(tmp_path, change, why):
+    cfg = live_config(tmp_path)
+    doc = dict(lg.arming_record(cfg, now=NOW), **change)
+    problems = lg.arming_problems(doc, cfg, NOW + 60)
+    assert problems and any(why in p for p in problems), problems
+
+
+def test_arming_record_expires(tmp_path):
+    cfg = live_config(tmp_path, competition_hours=24.0)
+    doc = lg.arming_record(cfg, now=NOW)
+    assert lg.arming_problems(doc, cfg, NOW + 48 * 3600 - 1) == []
+    assert any("expired" in p for p in lg.arming_problems(doc, cfg, NOW + 48 * 3600 + 1))
+    other = replace(cfg, initial_tmn=D("6000000"))          # INITIAL_TMN changed after arming
+    assert any("phrase" in p for p in lg.arming_problems(doc, other, NOW + 60))
 
 
 # --------------------------------------------------------------------------- status

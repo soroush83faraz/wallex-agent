@@ -162,7 +162,7 @@ def test_cancel_only_runtime_needs_a_key(tmp_path):
 
 # --------------------------------------------------------------------------- live gate in the builder
 def ok_runner(argv, cwd):
-    return 0, "12 passed in 0.5s\n"
+    return 0, f"{lg.MIN_SELFTEST_TESTS + 100} passed in 0.5s\n"
 
 
 def arm(tmp_path, *, age_h=1.0, canary=True):
@@ -223,26 +223,75 @@ def test_live_builder_with_all_gates_builds_a_keyed_client(tmp_path):
     assert '"kind":"live_gate"' in text and SENTINEL not in text and SENTINEL not in repr(rt.exchange)
 
 
-def test_resume_reads_the_arming_file_and_relaxes_freshness_only_for_a_started_run(tmp_path):
+def _start_competition(cfg, ts=NOW - 3600):
+    s = SqliteStore(live_store_path(cfg))
+    s.kv_set(K_START, ts)
+    s.close()
+
+
+def test_resume_never_starts_a_fresh_live_run(tmp_path):
+    """M1(a) / R3: a hand-written (or even a valid) LIVE_ARMED plus `live --resume` with no TTY must
+    NOT start a competition: the first live start is interactive with the typed phrase."""
+    arm(tmp_path)
+    cfg = live_cfg(tmp_path)
+    tr = RecordingTransport(responder=lambda *a: (500, {}, b""))
+    (tmp_path / lg.ARMING_FILE).write_text(PHRASE + "\n", encoding="utf-8")     # `echo ... > LIVE_ARMED`
+    with pytest.raises(LiveNotAllowedError, match="first live start must be interactive"):
+        build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(NOW), now=NOW)
+    lg.write_arming(cfg, now=NOW - 60)                                          # a proper record
+    with pytest.raises(LiveNotAllowedError, match="first live start must be interactive"):
+        build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(NOW), now=NOW)
+    assert len(tr.records) == 0 and not live_store_path(cfg).exists()
+
+
+def test_resume_reads_the_arming_record_and_relaxes_freshness_only_for_a_started_run(tmp_path):
     arm(tmp_path, age_h=30)
     cfg = live_cfg(tmp_path)
     tr = RecordingTransport(responder=lambda *a: (500, {}, b""))
-    with pytest.raises(LiveNotAllowedError, match="LIVE_ARMED"):
+    _start_competition(cfg)
+    with pytest.raises(LiveNotAllowedError, match="arming record"):
         build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(NOW), now=NOW)
-    (tmp_path / lg.ARMING_FILE).write_text(PHRASE + "\n", encoding="utf-8")
-    with pytest.raises(LiveNotAllowedError) as ei:               # nothing to resume: 24 h rule
+    (tmp_path / lg.ARMING_FILE).write_text(PHRASE + "\n", encoding="utf-8")      # legacy plain text
+    with pytest.raises(LiveNotAllowedError, match="not a structured arming record"):
         build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(NOW), now=NOW)
-    assert {c["name"] for c in ei.value.unmet} == {"selftest_fresh", "schema_attestation_fresh"}
-    s = SqliteStore(live_store_path(cfg))
-    s.kv_set(K_START, NOW - 3600)
-    s.close()
+    lg.write_arming(cfg, now=NOW - 600)
     rt = track(build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(NOW), now=NOW))
     assert rt.gate["resume"] is True and rt.gate["max_evidence_age_h"] == 48
     rt.close()
-    (tmp_path / lg.ARMING_FILE).write_text("START LIVE 6000000\n", encoding="utf-8")
-    with pytest.raises(LiveNotAllowedError) as ei:
-        build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(NOW), now=NOW)
-    assert {c["name"] for c in ei.value.unmet} == {"typed_phrase"}
+    with pytest.raises(LiveNotAllowedError) as ei:              # a fresh (non-resume) start: 24 h rule
+        build_live(cfg, flag_ack=True, typed_phrase=PHRASE, transport=tr, clock=SimClock(NOW), now=NOW)
+    assert {c["name"] for c in ei.value.unmet} == {"selftest_fresh", "schema_attestation_fresh"}
+    assert len(tr.records) == 0
+
+
+@pytest.mark.parametrize("problem", ["initial_tmn", "expired", "source_hash", "base_url", "data_dir"])
+def test_resume_refuses_an_arming_record_that_no_longer_matches(tmp_path, problem):
+    arm(tmp_path)
+    cfg = live_cfg(tmp_path)
+    _start_competition(cfg)
+    lg.write_arming(cfg, now=NOW - 600)
+    now = NOW
+    if problem == "initial_tmn":
+        cfg = replace(cfg, initial_tmn=D("6000000"))
+    elif problem == "expired":
+        now = NOW + 49 * 3600
+        arm(tmp_path, age_h=1.0)                    # (evidence itself is not what is tested here)
+    elif problem == "source_hash":
+        doc = json.loads((tmp_path / lg.ARMING_FILE).read_text(encoding="utf-8"))
+        doc["source_hash"] = "f" * 64
+        lg.atomic_write_json(tmp_path / lg.ARMING_FILE, doc)
+    elif problem == "base_url":
+        doc = json.loads((tmp_path / lg.ARMING_FILE).read_text(encoding="utf-8"))
+        doc["base_url"] = "https://api.example.test"
+        lg.atomic_write_json(tmp_path / lg.ARMING_FILE, doc)
+    elif problem == "data_dir":
+        doc = json.loads((tmp_path / lg.ARMING_FILE).read_text(encoding="utf-8"))
+        doc["data_dir"] = str(tmp_path / "other")
+        lg.atomic_write_json(tmp_path / lg.ARMING_FILE, doc)
+    tr = RecordingTransport(responder=lambda *a: (500, {}, b""))
+    with pytest.raises(LiveNotAllowedError, match="--resume refused"):
+        build_live(cfg, flag_ack=True, resume=True, transport=tr, clock=SimClock(now), now=now)
+    assert len(tr.records) == 0
 
 
 def _private_responder(fee_symbols=("BTCUSDT",)):

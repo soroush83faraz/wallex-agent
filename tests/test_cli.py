@@ -159,7 +159,7 @@ def test_live_canary_arm_refuse_without_gates(capsys, tmp_path):
         code, out, err = run_cli(capsys, argv, tmp_path, input_fn=lambda p: "START LIVE 5000000")
         assert code == EXIT_GATE, (argv, err)
         assert SENTINEL not in out + err
-        assert "unmet" in err or "LIVE_ARMED" in err
+        assert "unmet" in err or "LIVE_ARMED" in err or "first live start must be interactive" in err
     assert not (tmp_path / "state" / "live" / "state.db").exists()
 
 
@@ -171,7 +171,7 @@ def test_check_live_needs_a_key(capsys, tmp_path):
 def test_arm_live_writes_the_arming_file_when_all_gates_pass(capsys, tmp_path, monkeypatch):
     sd = tmp_path / "state"
     sd.mkdir()
-    lg.run_selftest(sd, runner=lambda a, c: (0, "3 passed in 0.1s"))
+    lg.run_selftest(sd, runner=lambda a, c: (0, f"{lg.MIN_SELFTEST_TESTS} passed in 0.1s"))
     import time
     now = time.time()
     iso = lg._iso(now - 60)
@@ -182,7 +182,9 @@ def test_arm_live_writes_the_arming_file_when_all_gates_pass(capsys, tmp_path, m
     code, out, err = run_cli(capsys, ["arm-live", "--i-understand-real-money"], tmp_path, env=env,
                              input_fn=lambda p: "START LIVE 5000000")
     assert code == EXIT_OK, err
-    assert lg.read_arming_phrase(sd) == "START LIVE 5000000"
+    doc, why = lg.read_arming(sd)
+    assert why is None and doc["phrase"] == "START LIVE 5000000" and doc["source_hash"] == lg.source_hash()
+    assert "never start a fresh live run" in out and SENTINEL not in json.dumps(doc)
 
 
 # --------------------------------------------------------------------------- kill

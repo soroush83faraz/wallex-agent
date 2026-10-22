@@ -409,18 +409,19 @@ def cmd_canary(ctx: Ctx) -> int:
 
 def cmd_arm_live(ctx: Ctx) -> int:
     cfg = _live_cfg(ctx)
+    now = float(time.time() if ctx.clock is None else ctx.clock.now())
     try:
         live_gate.check_live_allowed(cfg, flag_ack=bool(ctx.args.i_understand_real_money), typed_phrase=None,
-                                     input_fn=ctx.input_fn)
+                                     input_fn=ctx.input_fn, now=now)
     except LiveNotAllowedError as exc:
         err(str(exc))
         return EXIT_GATE
+    doc = live_gate.write_arming(cfg, now=now)
     path = cfg.state_path / live_gate.ARMING_FILE
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(live_gate.required_phrase(cfg) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    out(f"armed: {path} written. systemd (ConditionPathExists) may now start `live --resume`. "
-        "Delete the file to disarm.")
+    out(f"armed: {path} written (bound to this source tree, {cfg.api_base}, {cfg.data_dir}; expires "
+        f"{doc['expires_at']}).\n"
+        "It lets `live --resume` (systemd) CONTINUE a competition that you started interactively with "
+        "`live`; it can never start a fresh live run. Delete the file to disarm.")
     return EXIT_OK
 
 
@@ -624,8 +625,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wallex-agent", description=DESCRIPTION, epilog=EXIT_CODES_HELP,
                                 formatter_class=fmt)
     p.add_argument("--version", action="version", version=f"wallex-agent {__version__}")
-    p.add_argument("--data-dir", help="state directory (default: DATA_DIR or ./state)")
-    p.add_argument("--env-file", default=".env", help="dotenv file to read (default: .env)")
+    p.add_argument("--data-dir", help="state directory (default: DATA_DIR, else ./state of the CURRENT "
+                                      "directory; resolved to an absolute path; live needs it explicitly)")
+    p.add_argument("--env-file", default=".env",
+                   help="dotenv file to read (default: .env in the current directory; on a VPS pass the "
+                        "service's file, e.g. /etc/wallex-agent/wallex-agent.env)")
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
 
     def add(name: str, help_: str, desc: str | None = None) -> argparse.ArgumentParser:
@@ -689,23 +693,27 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("selftest", "run the test suite and write selftest.json (required for live)")
     s.set_defaults(func=cmd_selftest)
 
-    s = add("arm-live", "after all gates pass interactively, write <state>/LIVE_ARMED for systemd",
-            "Checks every live gate (incl. the typed phrase 'START LIVE <INITIAL_TMN>' at a TTY) and writes "
-            "the arming file that the systemd unit requires (ConditionPathExists) and that `live --resume` "
-            "reads instead of prompting. Delete the file to disarm.")
+    s = add("arm-live", "after all gates pass interactively, write the <state>/LIVE_ARMED record for systemd",
+            "Checks every live gate (incl. the typed phrase 'START LIVE <INITIAL_TMN>' at a TTY) and writes a "
+            "structured arming record (phrase, source hash, base URL, DATA_DIR, expiry = now + "
+            "COMPETITION_HOURS + 24 h) that the systemd unit requires (ConditionPathExists) and that "
+            "`live --resume` reads instead of prompting. --resume only CONTINUES a competition started "
+            "interactively with `live`; it never starts one. Delete the file to disarm.")
     s.add_argument("--i-understand-real-money", action="store_true", help="required")
     s.set_defaults(func=cmd_arm_live)
 
     s = add("live", "LIVE trading with real money (all gates required)",
-            "Gates: ENABLE_LIVE=true, WALLEX_API_KEY, --i-understand-real-money, fresh passing selftest and "
-            "check-live attestation for this source tree (<= 24 h; <= 48 h when resuming a started run), a "
-            "passing canary (<= 72 h), no KILL file, and the typed phrase 'START LIVE <INITIAL_TMN>' "
-            "(--resume reads it from <state>/LIVE_ARMED; no TTY needed). Startup always reconciles orders, "
-            "fills and balances first and refuses to trade on unexplained drift.")
+            "Gates: ENABLE_LIVE=true, WALLEX_API_KEY, an explicit DATA_DIR, --i-understand-real-money, fresh "
+            "passing selftest (full suite) and check-live attestation for this source tree (<= 24 h; <= 48 h "
+            "when resuming a started run), a passing canary (<= 72 h), no KILL file, and the typed phrase "
+            "'START LIVE <INITIAL_TMN>' at a terminal. --resume (systemd) only CONTINUES a competition already "
+            "started in this live store and reads the phrase from a valid, unexpired <state>/LIVE_ARMED "
+            "record (no TTY needed). Startup always reconciles orders, fills and balances first and refuses "
+            "to trade on unexplained drift.")
     s.add_argument("--stage", choices=["convert", "full"], default="full",
                    help="'convert': run ONLY the TMN->USDT conversion, then stop at READY; 'full' (default)")
     s.add_argument("--resume", action="store_true",
-                   help="unattended restart (systemd): phrase from LIVE_ARMED, never prompts")
+                   help="unattended restart (systemd) of a STARTED competition: phrase from LIVE_ARMED")
     s.add_argument("--i-understand-real-money", action="store_true", help="required")
     s.set_defaults(func=cmd_live)
 

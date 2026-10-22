@@ -15,6 +15,15 @@ dir and are written atomically:
 A resumed run (``live --resume``, systemd) may use selftest/attestation evidence up to 48 h old
 (``max_evidence_age_s``); a fresh start always needs <= 24 h. Nothing here talks to the exchange.
 The clock is injectable (``now`` = epoch seconds).
+
+``LIVE_ARMED`` (written by ``arm-live`` after every gate passed interactively) is a structured record
+bound to the phrase, this source tree, the base URL, the data dir and an expiry; ``live --resume``
+accepts it only to CONTINUE a competition that an operator already started interactively.
+
+MODEL OF PROTECTION: these gates stop ACCIDENTAL or automated misuse (a wrong command, a stale file,
+a changed source tree, a restart loop, a script without a terminal). They are not a defence against
+a deliberate attacker running as the same OS user or as root: such a process can read the API key
+and forge any evidence file. Use OS permissions for that (see docs/VPS_SYSTEMD_FA.md).
 """
 from __future__ import annotations
 
@@ -48,6 +57,18 @@ RESUME_MAX_EVIDENCE_AGE_S = 48 * 3600.0
 MAX_CANARY_AGE_S = 72 * 3600.0
 MAX_FUTURE_SKEW_S = 300.0          # evidence stamped in the future => clock trouble or tampering
 SELFTEST_TIMEOUT_S = 900.0
+# A selftest that ran fewer tests than this did not run THE suite (e.g. ``-k``/PYTEST_ADDOPTS, a
+# trimmed tests dir): it attests nothing. The real suite has well over 2000 tests.
+MIN_SELFTEST_TESTS = 1000
+ARMING_VERSION = 1
+ARMING_GRACE_S = 24 * 3600.0       # an arming record expires competition_hours + 24 h after arming
+# Environment variables the selftest's pytest subprocess may see (everything else - API keys,
+# DATA_DIR, ENABLE_LIVE, TRADING_MODE, proxies, PYTEST_ADDOPTS, ... - is dropped).
+_SELFTEST_ENV_KEEP = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "USER", "USERNAME", "LOGNAME", "LANG", "LANGUAGE", "TZ", "PYTHONIOENCODING", "PYTHONUTF8",
+    "VIRTUAL_ENV", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS"})
 
 Runner = Callable[[Sequence[str], Path], "tuple[int, str]"]
 InputFn = Callable[[str], str]
@@ -134,19 +155,36 @@ def required_canary_phrase(config: Config) -> str:
 
 
 # --------------------------------------------------------------------------- source hash
+def _hashed_bytes(data: bytes) -> bytes:
+    """Text (no NUL byte, git's own heuristic) has CRLF normalised to LF so Windows and Linux
+    checkouts of one commit hash alike; binaries (.pyd/.so, ...) are hashed byte for byte."""
+    return data if b"\0" in data else data.replace(b"\r\n", b"\n")
+
+
+def source_files(package_dir: str | Path | None = None) -> list[tuple[str, Path]]:
+    """What ``source_hash`` covers, as sorted ``(label, path)``: EVERY file under the package
+    (any type: .py, .pyd/.so, data; only ``__pycache__`` is skipped), plus - in a source checkout -
+    ``pyproject.toml`` and ``tests/**/*.py`` (incl. ``tests/conftest.py``) that the selftest runs."""
+    pkg = Path(package_dir) if package_dir is not None else PACKAGE_DIR
+    out = [(f"package/{p.relative_to(pkg).as_posix()}", p) for p in pkg.rglob("*")
+           if p.is_file() and "__pycache__" not in p.relative_to(pkg).parts]
+    root = project_root(pkg)
+    if root is not None:
+        if (root / "pyproject.toml").is_file():
+            out.append(("project/pyproject.toml", root / "pyproject.toml"))
+        tests = root / "tests"
+        out += [(f"project/tests/{p.relative_to(tests).as_posix()}", p) for p in tests.rglob("*.py")
+                if p.is_file() and "__pycache__" not in p.relative_to(tests).parts]
+    return sorted(out, key=lambda x: x[0])
+
+
 def source_hash(package_dir: str | Path | None = None) -> str:
-    """SHA-256 over every ``*.py`` under the package (sorted relative paths, ``__pycache__``
-    ignored). Each file contributes its relative POSIX path and its bytes with CRLF normalised to
-    LF, so a Windows checkout and a Linux checkout of the same commit hash identically, while a
-    rename, addition or deletion changes the hash."""
-    root = Path(package_dir) if package_dir is not None else PACKAGE_DIR
-    files = sorted((p for p in root.rglob("*.py")
-                    if "__pycache__" not in p.relative_to(root).parts and p.is_file()),
-                   key=lambda p: p.relative_to(root).as_posix())
+    """SHA-256 over ``source_files``: each file contributes its label and its bytes (text CRLF->LF),
+    so a rename, addition, deletion or edit of ANY covered file changes the hash."""
     h = hashlib.sha256()
-    for p in files:
-        rel = p.relative_to(root).as_posix().encode("utf-8")
-        body = p.read_bytes().replace(b"\r\n", b"\n")
+    for label, p in source_files(package_dir):
+        rel = label.encode("utf-8")
+        body = _hashed_bytes(p.read_bytes())
         h.update(len(rel).to_bytes(4, "big") + rel)
         h.update(len(body).to_bytes(8, "big") + body)
     return h.hexdigest()
@@ -183,10 +221,18 @@ def _parse_junit_counts(path: Path) -> dict[str, int] | None:
     return {k: v for k, v in counts.items() if v}
 
 
+def selftest_env(environ: Mapping[str, str], src: str | Path) -> dict[str, str]:
+    """The SCRUBBED environment of the selftest's pytest run: an allow-list of OS basics only. The
+    API key, DATA_DIR, ENABLE_LIVE, TRADING_MODE, every other config variable, proxies and pytest
+    option variables never reach the tests, and only the hashed tree (``src``) is importable."""
+    env = {k: v for k, v in environ.items()
+           if k.upper() in _SELFTEST_ENV_KEEP or k.upper().startswith("LC_")}
+    env["PYTHONPATH"] = str(src)    # test exactly the tree that was hashed, not some installed copy
+    return env
+
+
 def _default_runner(argv: Sequence[str], cwd: Path) -> tuple[int, str]:
-    env = dict(os.environ)
-    src = str(cwd / "src")    # test exactly the tree that was hashed, not some installed copy
-    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env = selftest_env(os.environ, cwd / "src")
     try:
         cp = subprocess.run(list(argv), cwd=str(cwd), env=env, capture_output=True, text=True,
                             encoding="utf-8", errors="replace", timeout=SELFTEST_TIMEOUT_S)
@@ -243,6 +289,9 @@ def run_selftest(state_dir: str | Path, *, runner: Runner | None = None, clock: 
             result["reason"] = f"{failures} failing test(s)"
         elif counts.get("passed", 0) == 0:
             result["reason"] = "no passing tests found in the pytest output"
+        elif counts.get("passed", 0) < MIN_SELFTEST_TESTS:
+            result["reason"] = (f"only {counts.get('passed', 0)} test(s) passed (< {MIN_SELFTEST_TESTS}): "
+                                "that is not the project's full suite, so it attests nothing")
         else:
             result["passed"] = True
             result["reason"] = "all tests passed"
@@ -315,16 +364,63 @@ def read_typed_phrase(config: Config, *, input_fn: InputFn | None = None,
         raise LiveNotAllowedError("typed confirmation aborted") from exc
 
 
-def read_arming_phrase(state_dir: str | Path) -> str | None:
-    """Content of the operator-created ``<state_dir>/LIVE_ARMED`` file (first line), or None.
-    For an unattended restart (systemd, no TTY) the CLI may pass this as ``typed_phrase``."""
-    p = Path(state_dir) / ARMING_FILE
-    try:
-        text = p.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    lines = text.splitlines()
-    return lines[0] if lines else ""
+# --------------------------------------------------------------------------- arming record
+def _norm_dir(path: Any) -> str:
+    return os.path.normcase(os.path.abspath(str(path or "")))
+
+
+def arming_record(config: Config, *, now: float) -> dict[str, Any]:
+    """What ``arm-live`` writes to ``<state>/LIVE_ARMED`` once every gate passed interactively."""
+    return {"version": ARMING_VERSION, "phrase": required_phrase(config), "source_hash": source_hash(),
+            "armed_at": _iso(now),
+            "expires_at": _iso(now + float(config.competition_hours) * 3600.0 + ARMING_GRACE_S),
+            "initial_tmn": _amount_text(config), "base_url": config.api_base,
+            "data_dir": str(config.data_dir)}
+
+
+def write_arming(config: Config, *, now: float, state_dir: str | Path | None = None) -> dict[str, Any]:
+    doc = arming_record(config, now=now)
+    atomic_write_json(Path(state_dir if state_dir is not None else config.state_path) / ARMING_FILE, doc)
+    return doc
+
+
+def read_arming(state_dir: str | Path) -> tuple[dict[str, Any] | None, str | None]:
+    """``(record, None)`` or ``(None, why)``. A hand-written / legacy plain-text file is refused."""
+    doc, err = _read_json(Path(state_dir) / ARMING_FILE)
+    if doc is None:
+        return None, ("missing" if err == "missing" else
+                      f"{err}: not a structured arming record (re-run `wallex-agent arm-live`)")
+    return doc, None
+
+
+def arming_problems(doc: Mapping[str, Any], config: Config, now: float) -> list[str]:
+    """Why ``doc`` may NOT stand in for the typed phrase (empty list = valid): it must carry the
+    current phrase, source hash, base URL and data dir, and be within its expiry window."""
+    problems: list[str] = []
+    if doc.get("version") != ARMING_VERSION:
+        problems.append(f"version {doc.get('version')!r} is not {ARMING_VERSION}")
+    if doc.get("phrase") != required_phrase(config):
+        problems.append(f"phrase does not match '{required_phrase(config)}' (INITIAL_TMN changed?)")
+    if str(doc.get("initial_tmn")) != _amount_text(config):
+        problems.append("initial_tmn differs from the configuration")
+    if doc.get("source_hash") != source_hash():
+        problems.append("source_hash differs: the code changed since arming (re-run selftest, check-live, "
+                        "arm-live)")
+    if _norm_url(doc.get("base_url")) != _norm_url(config.api_base):
+        problems.append(f"base_url {doc.get('base_url')!r} differs from {config.api_base!r}")
+    if _norm_dir(doc.get("data_dir")) != _norm_dir(config.data_dir):
+        problems.append(f"armed for DATA_DIR {doc.get('data_dir')!r}, not {config.data_dir!r}")
+    armed, expires = _parse_iso(doc.get("armed_at")), _parse_iso(doc.get("expires_at"))
+    if armed is None or expires is None:
+        problems.append("no valid UTC armed_at/expires_at")
+    else:
+        if armed - now > MAX_FUTURE_SKEW_S:
+            problems.append(f"armed {(armed - now) / 3600:.2f} h in the future")
+        if expires - armed > float(config.competition_hours) * 3600.0 + ARMING_GRACE_S + 1:
+            problems.append("expiry window longer than competition_hours + 24 h")
+        if now > expires:
+            problems.append(f"expired at {doc.get('expires_at')} (re-run `wallex-agent arm-live`)")
+    return problems
 
 
 # --------------------------------------------------------------------------- evaluation
@@ -343,6 +439,13 @@ def _evidence_checks(prefix: str, doc: dict[str, Any] | None, err: str | None, *
     why = str(doc.get("reason") or "; ".join(map(str, doc.get("reasons") or [])))[:200]
     out.append(_cond(f"{prefix}_{ok_key}", passed,
                      f"{label}: {ok_key}={doc.get(ok_key)!r}" + (f" ({why})" if why and not passed else "")))
+    if prefix == "selftest":
+        counts = doc.get("counts") if isinstance(doc.get("counts"), Mapping) else {}
+        n = counts.get("passed")
+        enough = isinstance(n, int) and not isinstance(n, bool) and n >= MIN_SELFTEST_TESTS \
+            and doc.get("failures") == 0
+        out.append(_cond("selftest_test_count", enough,
+                         f"{label}: {n!r} passing test(s) (need >= {MIN_SELFTEST_TESTS}, no failures)"))
     hash_ok = isinstance(doc.get("source_hash"), str) and doc.get("source_hash") == current_hash
     out.append(_cond(f"{prefix}_source_hash", hash_ok,
                      f"{label} source_hash matches the current source tree" if hash_ok else
@@ -488,6 +591,8 @@ def arm_status(config: Config, *, now: float | None = None,
     att, _ = _read_json(sdir / ATTESTATION_FILE)
     missing = [c["name"] for c in conds if not c["met"]]
     canary_verified = canary_verified_items(config, sdir, t)
+    arm_doc, arm_err = read_arming(sdir)
+    arm_problems = arming_problems(arm_doc, config, t) if arm_doc is not None else [str(arm_err)]
     return {
         "mode": getattr(config.mode, "value", str(config.mode)),
         "base_url": config.api_base,
@@ -499,6 +604,9 @@ def arm_status(config: Config, *, now: float | None = None,
         "required_at_launch": ["--i-understand-real-money flag",
                                f"typed phrase '{required_phrase(config)}'"],
         "arming_file_present": (sdir / ARMING_FILE).is_file(),
+        "arming": {"valid": arm_doc is not None and not arm_problems, "problems": arm_problems,
+                   "expires_at": (arm_doc or {}).get("expires_at"),
+                   "note": "only `live --resume` uses it, and only to CONTINUE a started competition"},
         "unverified_api_items": [u for u in (att or {}).get("unverified") or []
                                  if u not in canary_verified],
         "canary_verified_api_items": canary_verified,
