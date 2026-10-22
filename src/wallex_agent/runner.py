@@ -205,7 +205,10 @@ class AgentRunner:
                                      "derived": rep.get("derived")})
             if self.sm.state is BotState.STOPPED:
                 stop = self.store.kv_get("exec.stop") or {}
-                self.reason = f"bot is STOPPED: {stop.get('reason') or self._last_stop_reason()}"
+                hint = "" if stop.get("deadline") else (
+                    " | to continue after checking the account: delete KILL (if present), then "
+                    "`wallex-agent unstop`")
+                self.reason = f"bot is STOPPED: {stop.get('reason') or self._last_stop_reason()}{hint}"
                 return "stopped"
             if not rep.get("ok"):
                 self.reason = f"startup reconciliation incomplete: {'; '.join(map(str, rep.get('actions') or []))}"

@@ -18,7 +18,7 @@ from wallex_agent.runner import (EXIT_GATE, EXIT_INTERRUPTED, EXIT_KILLED, EXIT_
                                  EXIT_STOPPED, EXIT_UNAVAILABLE, EXIT_USAGE)
 
 COMMANDS = ["demo", "backtest", "fetch-history", "diagnose", "paper", "check-live", "canary", "selftest",
-            "arm-live", "live", "status", "kill", "report", "trace"]
+            "arm-live", "live", "status", "kill", "unstop", "report", "trace"]
 
 
 def env_for(tmp_path, **kw):
@@ -304,6 +304,151 @@ def test_kill_cancel_open_acts_on_live_whenever_the_live_store_exists(capsys, tm
     # without the key the live cancel path refuses loudly instead of pretending
     code, out, err = run_cli(capsys, ["kill", "--cancel-open"], tmp_path, env={"DATA_DIR": str(sd)})
     assert code == EXIT_REFUSED and "WALLEX_API_KEY" in err
+
+
+# --------------------------------------------------------------------------- unstop (F2)
+BASE = "https://api.wallex.ir"
+UNSTOP_NOW = 1_800_000_000.0
+SHORT_REASON = "needs_manual_reconcile: ledger/exchange shortfall: TMN ledger 5000000 exchange 4000000 short 1000000"
+
+
+def _live_evidence(sd):
+    sd.mkdir(parents=True, exist_ok=True)
+    lg.run_selftest(sd, runner=lambda a, c: (0, f"{lg.MIN_SELFTEST_TESTS} passed in 1s"),
+                    clock=SimClock(UNSTOP_NOW - 60))
+    lg.write_schema_attestation(sd, {"ok": True, "get_only": True, "base_url": BASE, "at": lg._iso(UNSTOP_NOW - 60),
+                                     "checks": [], "undocumented": []}, BASE)
+    lg.atomic_write_json(sd / lg.CANARY_FILE, {"ok": True, "at": lg._iso(UNSTOP_NOW - 60), "base_url": BASE})
+
+
+def _stopped_live_store(sd, *, start=None):
+    from decimal import Decimal as D
+    from wallex_agent.portfolio import Portfolio
+    from wallex_agent.runner import K_START
+    from wallex_agent.state import StateMachine
+    from wallex_agent.store import SqliteStore
+    from wallex_agent.types import BotState
+    s = SqliteStore(sd / "live" / "state.db", clock=SimClock(UNSTOP_NOW - 600))
+    Portfolio(s, D("5000000"))
+    if start is not None:
+        s.kv_set(K_START, start)
+    s.kv_set("exec.stop", {"reason": SHORT_REASON})
+    StateMachine(s, SimClock(UNSTOP_NOW - 600)).transition(BotState.STOPPED, SHORT_REASON)
+    s.close()
+
+
+def _unstop_responder(tmn="5000000"):
+    from urllib.parse import urlsplit
+    from tests._runner_support import public_responder
+    pub = public_responder()
+    docs = {"/v1/account/balances": {"balances": {"TMN": {"asset": "TMN", "faName": "t", "fiat": True,
+                                                          "value": tmn, "locked": "0"}}},
+            "/v1/account/openOrders": {"orders": []}, "/v1/account/trades": {"AccountLatestTrades": []},
+            "/v1/account/fee": {s: {"makerFeeRate": "0.0025", "takerFeeRate": "0.0025", "recent_days_sum": 0}
+                                for s in ("BTCUSDT", "USDTTMN")}}
+    methods = []
+
+    def respond(method, url, headers, body):
+        methods.append(method)
+        path = urlsplit(url).path
+        if method == "GET" and path in docs:
+            return 200, {}, json.dumps({"success": True, "message": "ok", "result": docs[path]}).encode()
+        return pub(method, url, headers, body)
+    return respond, methods
+
+
+def _unstop(capsys, tmp_path, *, tmn="5000000", extra=(), env_extra=None):
+    from wallex_agent.modes import RecordingTransport
+    respond, methods = _unstop_responder(tmn)
+    env = env_for(tmp_path, ENABLE_LIVE="true", TRADING_MODE="live", **(env_extra or {}))
+    code, out, err = run_cli(capsys, ["unstop", *extra], tmp_path, env=env,
+                             transport=RecordingTransport(responder=respond), clock=SimClock(UNSTOP_NOW),
+                             input_fn=lambda p: "START LIVE 5000000")
+    return code, out, err, methods
+
+
+def _live_snapshot(tmp_path):
+    from wallex_agent.modes import open_snapshot
+    return open_snapshot(tmp_path / "state" / "live" / "state.db")
+
+
+def test_unstop_live_after_a_clean_read_only_reconcile(capsys, tmp_path):
+    sd = tmp_path / "state"
+    _live_evidence(sd)
+    _stopped_live_store(sd)
+    code, out, err, methods = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"])
+    assert code == EXIT_OK, err
+    assert "STOPPED because: " + SHORT_REASON in out and "unstopped: STOPPED -> UNFUNDED" in out
+    assert set(methods) == {"GET"}                          # read-only: nothing placed or cancelled
+    snap = _live_snapshot(tmp_path)
+    try:
+        assert snap.kv_get("bot_state")["state"] == "UNFUNDED" and snap.kv_get("exec.stop") is None
+        assert [e.payload["to"] for e in snap.iter_events("operator_unstop")] == ["UNFUNDED"]
+        last = [e.payload for e in snap.iter_events("state_transition")][-1]
+        assert last["forced"] is True and last["from"] == "STOPPED"
+    finally:
+        snap.close()
+    audits = list((sd / "live" / "runs").rglob("audit.jsonl"))
+    assert audits and "operator_unstop" in audits[0].read_text(encoding="utf-8")
+    assert SENTINEL not in out + err
+
+
+def test_unstop_refuses_and_prints_the_numbers_when_the_ledger_is_short(capsys, tmp_path):
+    sd = tmp_path / "state"
+    _live_evidence(sd)
+    _stopped_live_store(sd)
+    code, out, err, methods = _unstop(capsys, tmp_path, tmn="4000000", extra=["--i-understand-real-money"])
+    assert code == EXIT_STOPPED and "unstop REFUSED" in err
+    doc = json.loads(out[out.index("{"): out.rindex("}") + 1])
+    (tmn,) = [d for d in doc["drifts"] if d["asset"] == "TMN"]
+    assert (tmn["ledger"], tmn["exchange"], tmn["shortfall"], tmn["verdict"]) == ("5000000", "4000000", "1000000",
+                                                                                 "short")
+    assert any("TMN ledger 5000000 exchange 4000000 short 1000000" in p for p in doc["problems"])
+    snap = _live_snapshot(tmp_path)
+    try:
+        assert snap.kv_get("bot_state")["state"] == "STOPPED"            # nothing changed
+    finally:
+        snap.close()
+    assert set(methods) == {"GET"}
+
+
+def test_unstop_refusals_kill_flag_running_agent_and_finished_competition(capsys, tmp_path):
+    sd = tmp_path / "state"
+    _live_evidence(sd)
+    _stopped_live_store(sd)
+    code, out, err, _ = _unstop(capsys, tmp_path)                              # no flag
+    assert code == EXIT_GATE and "--i-understand-real-money" in err
+    (sd / "KILL").write_text("x", encoding="utf-8")
+    code, out, err, _ = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"])
+    assert code == EXIT_REFUSED and "Delete it yourself first" in err and (sd / "KILL").exists()
+    (sd / "KILL").unlink()
+    from wallex_agent.store import SqliteStore
+    agent = SqliteStore(sd / "live" / "state.db")                              # a live agent is running
+    try:
+        code, out, err, _ = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"])
+        assert code == EXIT_REFUSED and "Stop the running agent first" in err
+    finally:
+        agent.close()
+    sd2 = tmp_path / "s2"
+    _live_evidence(sd2)
+    _stopped_live_store(sd2, start=UNSTOP_NOW - 30 * 3600)                     # 24 h window is over
+    code, out, err, _ = _unstop(capsys, tmp_path, extra=["--i-understand-real-money"],
+                                env_extra={"DATA_DIR": str(sd2)})
+    assert code == EXIT_REFUSED and "competition window ended" in err
+
+
+def test_unstop_paper_is_a_ledger_only_check(capsys, tmp_path):
+    sd = tmp_path / "state"
+    assert run_cli(capsys, ["kill", "--force-write"], tmp_path)[0] == EXIT_OK
+    code, out, _ = run_cli(capsys, ["paper", "--seconds", "30"], tmp_path, transport=recording_public_transport(),
+                           clock=SimClock(1_700_000_000.0))
+    assert code == EXIT_KILLED
+    code, out, err = run_cli(capsys, ["unstop", "--mode", "paper"], tmp_path)
+    assert code == EXIT_REFUSED and "Delete it yourself first" in err
+    (sd / "KILL").unlink()
+    code, out, err = run_cli(capsys, ["unstop", "--mode", "paper"], tmp_path)
+    assert code == EXIT_OK, err
+    assert "STOPPED -> UNFUNDED" in out and "ledger-only" in out
 
 
 # --------------------------------------------------------------------------- summary texts (F3)

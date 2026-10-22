@@ -99,6 +99,39 @@ def test_late_accept_found_at_startup_after_a_restart(tmp_path):
         w.close()
 
 
+def test_unstop_is_refused_after_a_late_accept(tmp_path):
+    """F2 + M4: the late order's fills can never enter the ledger (its record is final), so the
+    read-only reconcile behind `unstop` stays unclean and the operator must decide by hand."""
+    import pytest
+    from wallex_agent.errors import InvariantError
+    w = funded_world(tmp_path)
+    stash, real_create = queued_gateway_timeout(w)
+    assert w.engine.submit(w.entry("0.0002")).status == "abandoned"
+    real_create(stash[0])
+    w.engine.poll_and_manage()
+    assert w.sm.state is S.STOPPED
+    check = w.engine.unstop_check()
+    assert not check["ok"]
+    assert any("ABANDONED order showed up" in p for p in check["problems"])
+    assert any(p.startswith("ledger/exchange shortfall: USDT ledger") for p in check["problems"])
+    with pytest.raises(InvariantError):
+        w.engine.operator_unstop(check)
+    assert w.sm.state is S.STOPPED
+
+
+def test_operator_unstop_needs_a_clean_check_and_a_stopped_bot(tmp_path):
+    import pytest
+    from wallex_agent.errors import InvariantError
+    w = funded_world(tmp_path)
+    with pytest.raises(InvariantError):
+        w.engine.operator_unstop({"ok": True, "derived": "READY"})        # not STOPPED
+    w.sm.transition(S.STOPPED, "test stop")
+    check = w.engine.unstop_check()
+    assert check["ok"] and check["derived"] == "READY", check
+    assert w.engine.operator_unstop(check) is S.READY and w.engine.status()["stop"] is None
+    assert w.engine.submit(w.entry()).status == "filled"
+
+
 # --------------------------------------------------------------------------- quarantine
 def test_quarantine_is_never_lifted_on_absence_alone(tmp_path):
     w = funded_world(tmp_path)

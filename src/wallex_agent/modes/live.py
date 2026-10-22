@@ -8,8 +8,9 @@
 * ``build_cancel_only_runtime`` - for ``kill --cancel-open``: the client is wrapped in
   ``CancelOnlyExchange``, whose ``create_order`` refuses locally, so it can only read and cancel.
 
-Everything else that needs the key (``check-live``) gets ``read_only=True`` (no POST/DELETE possible).
-``tests/test_modes.py`` greps the source tree to keep it that way.
+Everything else that needs the key (``check-live``, ``unstop`` via ``build_unstop_runtime``) gets
+``read_only=True`` (no POST/DELETE possible). ``tests/test_modes.py`` greps the source tree to keep it
+that way.
 """
 from __future__ import annotations
 
@@ -201,6 +202,30 @@ def build_canary_runtime(config: Config, *, flag_ack: bool, typed_phrase: str | 
     tr = _transport(cfg, transport)
     client = _keyed_write_client(cfg, tr, clk)
     return _live_runtime(cfg, clock=clk, transport=tr, client=client, gate=gate, label="live_canary")
+
+
+def build_unstop_runtime(config: Config, *, flag_ack: bool, input_fn: Callable[[str], str] | None = None,
+                         transport: Any = None, clock: Clock | None = None, now: float | None = None) -> Runtime:
+    """``unstop`` (live): the SAME gate evidence as ``live --resume`` (flag, ENABLE_LIVE, key, explicit
+    DATA_DIR, selftest, check-live, canary, no KILL, and the phrase: from a valid LIVE_ARMED record
+    when the competition has started, otherwise typed at a terminal) - but the exchange client is
+    READ-ONLY, so ``unstop`` can never place or cancel an order; it does not start trading."""
+    clk = clock or RealClock()
+    cfg = replace(config, mode=Mode.LIVE)
+    t = float(now if now is not None else clk.now())
+    started = competition_started(cfg)
+    phrase = None
+    if started:
+        doc, _ = live_gate.read_arming(cfg.state_path)
+        if doc is not None and not live_gate.arming_problems(doc, cfg, t):
+            phrase = str(doc["phrase"])
+    gate = live_gate.check_live_allowed(
+        cfg, flag_ack=flag_ack, typed_phrase=phrase, now=t, input_fn=input_fn,
+        max_evidence_age_s=live_gate.RESUME_MAX_EVIDENCE_AGE_S if started else live_gate.MAX_EVIDENCE_AGE_S)
+    gate["purpose"] = "unstop"
+    tr = _transport(cfg, transport)
+    client = read_only_client(cfg, transport=tr, clock=clk)
+    return _live_runtime(cfg, clock=clk, transport=tr, client=client, gate=gate, label="live_unstop")
 
 
 def build_cancel_only_runtime(config: Config, *, transport: Any = None,

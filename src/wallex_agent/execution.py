@@ -1400,6 +1400,92 @@ class ExecutionEngine:
         self._audit("reconcile_startup", report)
         return report
 
+    # ------------------------------------------------------------------ operator unstop
+    def unstop_check(self) -> dict[str, Any]:
+        """The startup reconcile, READ-ONLY (``unstop``; the exchange client given to it cannot write):
+        one adopt-only lookup per unknown order, a GET refresh of open ones, the abandoned-order watch,
+        unknown open orders, ledger vs exchange per asset, and the state the ledger implies. Clean
+        (``ok``) only if nothing is unresolved, unexplained or short."""
+        cfg = self.config
+        btc, usd = cfg.btc_symbol, cfg.usdt_symbol
+        problems: list[str] = []
+        for rec in self.store.unresolved_orders():
+            if rec.lifecycle in (L.SENDING, L.UNKNOWN_OUTCOME):
+                self.resolve_unknown(rec, adopt_only=True)
+            elif rec.lifecycle in (L.OPEN, L.PARTIAL):
+                self._refresh(rec)
+        for rec in self.store.unresolved_orders():
+            problems.append(f"order {rec.client_id} ({rec.side.value} {plain(rec.quantity)} {rec.symbol}) is "
+                            f"{rec.lifecycle.value}: it must be resolved first (cancel it in the Wallex app or "
+                            "with `kill --cancel-open`)")
+        watch = self.check_abandoned(stage="unstop")
+        if watch is False:
+            problems.append(f"an ABANDONED order showed up or trades are unexplained: "
+                            f"{str((self.store.kv_get(K_STOP) or {}).get('reason', ''))[:300]}")
+        elif watch is None:
+            problems.append("ABANDONED order(s) could not be re-checked (exchange reads failed)")
+        try:
+            opens = [o for o in self.exchange.list_open_orders() if o.symbol in (btc, usd)]
+        except Exception as exc:  # noqa: BLE001
+            opens = []
+            problems.append(f"open orders unavailable ({type(exc).__name__})")
+        for o in opens:
+            rec = self.store.find_order_by_exchange_id(o.client_order_id)
+            if rec is None or rec.is_terminal:
+                problems.append(f"open order {o.client_order_id} ({o.side.value} {plain(o.orig_qty)} {o.symbol} @ "
+                                f"{plain(o.price)}) is unknown to (or closed in) the store")
+        drifts: list[dict[str, Any]] = []
+        try:
+            rr = self.portfolio.reconcile(self._balances(), self.tolerance, locked_semantics="unknown")
+            for a, d in sorted(rr.drifts.items()):
+                actual = d.actual_value + (d.actual_locked if d.interpretation == "value+locked" else ZERO)
+                drifts.append({"asset": a, "ledger": d.expected, "exchange": actual, "exchange_value": d.actual_value,
+                               "exchange_locked": d.actual_locked, "difference": d.drift,
+                               "shortfall": max(ZERO, -d.drift), "tolerance": d.tolerance, "verdict": d.direction})
+            if not rr.ok:
+                problems.append(f"ledger/exchange shortfall: {drift_text(rr)}")
+        except _Decline as d:
+            problems.append(str(d))
+        derived: BotState | None = None
+        why = ""
+        try:
+            rules = {s: self._rules(s, refresh=True) for s in (btc, usd)}
+            books: dict[str, OrderBook] = {}
+            try:
+                books[btc] = self.exchange.get_order_book(btc)
+            except Exception:  # noqa: BLE001 - derive_state copes without a book
+                pass
+            ledger = {a: Balance(a, v) for a, v in self.portfolio.expected_balances().items() if v >= 0}
+            derived, why = derive_state_explained(ledger, [], rules, books, btc_symbol=btc, usdt_symbol=usd)
+            if derived is BotState.STOPPED:
+                problems.append(f"no trading state can be derived: {why}")
+        except _Decline as d:
+            problems.append(str(d))
+        out = {"ok": not problems, "problems": problems, "drifts": jsonable(drifts),
+               "derived": derived.value if derived is not None else None, "why": why}
+        self._audit("unstop_check", out)
+        return out
+
+    def operator_unstop(self, check: Mapping[str, Any], *, note: str = "") -> BotState:
+        """Force STOPPED -> the derived state after a CLEAN ``unstop_check``. Clears the stop marker
+        (and a now-disproven shortfall suspicion) and nothing else: KILL, LIVE_ARMED, quarantines and
+        the abandoned-order watch list stay as they are."""
+        if not check.get("ok") or not check.get("derived"):
+            raise InvariantError("operator_unstop needs a clean unstop_check")
+        if self.sm.state is not BotState.STOPPED:
+            raise InvariantError(f"bot is {self.sm.state.value}, not STOPPED")
+        to = BotState(check["derived"])
+        previous = self.store.kv_get(K_STOP)
+        evidence = {"previous_stop": previous, "derived_why": check.get("why"), "drifts": check.get("drifts"),
+                    "note": note}
+        with self.store.transaction():
+            self.sm.transition(to, f"operator_unstop: {check.get('why')}", jsonable(evidence), force=True)
+            self.store.kv_set(K_STOP, None)
+            self.store.kv_set(K_SHORTFALL, None)
+            self.store.append("operator_unstop", jsonable({"to": to.value, **evidence}))
+        self._alert("operator_unstop", {"to": to.value, **evidence})
+        return to
+
     # ------------------------------------------------------------------ reporting
     def status(self) -> dict[str, Any]:
         now = self._now()

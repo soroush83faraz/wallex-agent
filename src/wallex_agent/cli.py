@@ -606,6 +606,135 @@ def cmd_kill(ctx: Ctx) -> int:
     return EXIT_OK if not res["still_open"] else EXIT_STOPPED
 
 
+def cmd_unstop(ctx: Ctx) -> int:
+    """F2: leave STOPPED after a human checked the account - only if a read-only reconcile is clean."""
+    cfg = ctx.config
+    kill = Path(cfg.kill_file)
+    if kill.exists():
+        err(f"unstop refused: the KILL file {kill} exists. Delete it yourself first (deliberately: nothing "
+            "removes it automatically), then run `unstop` again.")
+        return EXIT_REFUSED
+    mode = ctx.mode()
+    if mode is Mode.BACKTEST:
+        err("unstop: backtest runs are disposable; start a new one.")
+        return EXIT_USAGE
+    return _unstop_paper(ctx) if mode is Mode.PAPER else _unstop_live(ctx)
+
+
+def _unstop_live(ctx: Ctx) -> int:
+    from .modes import live_store_path
+    from .modes.live import build_unstop_runtime
+    cfg = _live_cfg(ctx)
+    if not ctx.args.i_understand_real_money:
+        err("unstop (live) needs --i-understand-real-money: it re-enables a REAL-money ledger (it never trades "
+            "by itself; you start `live` afterwards).")
+        return EXIT_GATE
+    db = live_store_path(cfg)
+    if not db.is_file():
+        err(f"unstop: no live store at {db}: nothing to unstop.")
+        return EXIT_REFUSED
+    try:
+        rt = build_unstop_runtime(cfg, flag_ack=True, input_fn=ctx.input_fn, transport=ctx.transport,
+                                  clock=ctx.clock)
+    except LiveNotAllowedError as exc:
+        err(str(exc))
+        return EXIT_GATE
+    except InstanceLockError as exc:
+        err(f"unstop: {exc}. Stop the running agent first.")
+        return EXIT_REFUSED
+    try:
+        return _unstop_with(rt, ctx)
+    finally:
+        rt.close()
+
+
+def _unstop_with(rt: Any, ctx: Ctx) -> int:
+    from .types import BotState
+    if rt.sm.state is not BotState.STOPPED:
+        out(f"the {rt.mode.value} ledger is {rt.sm.state.value}, not STOPPED: nothing to do.")
+        return EXIT_OK
+    now = float(rt.clock.now())
+    start = rt.store.kv_get(K_START)
+    if start is not None and now >= float(start) + float(rt.config.competition_hours) * 3600:
+        err(f"unstop refused: the competition window ended at {_iso(float(start) + rt.config.competition_hours * 3600)}"
+            " (STOPPED is the normal end of the run).")
+        return EXIT_REFUSED
+    stop = rt.store.kv_get("exec.stop") or {}
+    hist = rt.sm.history()
+    out(f"STOPPED because: {stop.get('reason') or (hist[-1].get('reason') if hist else 'unknown')}")
+    out("Read-only reconcile (orders, abandoned-order watch, open orders, ledger vs exchange)...")
+    check = rt.engine.unstop_check()
+    out(_json({"drifts": check["drifts"], "problems": check["problems"], "derived_state": check["derived"],
+               "why": check["why"]}))
+    if not check["ok"]:
+        err("unstop REFUSED: the reconcile is not clean (see 'problems' above). Nothing was changed; fix the "
+            "cause (check the account in the Wallex app) and run `unstop` again.")
+        return EXIT_STOPPED
+    to = rt.engine.operator_unstop(check, note="wallex-agent unstop")
+    out(f"unstopped: STOPPED -> {to.value} ({check['why']}). Nothing else was changed: KILL, LIVE_ARMED, the "
+        "evidence files, quarantines and the abandoned-order watch list are untouched. Trading resumes only "
+        "when you start the agent again.")
+    return EXIT_OK
+
+
+def _unstop_paper(ctx: Ctx) -> int:
+    """Paper: the simulated exchange of a finished session no longer exists, so only the store itself
+    can be checked (no unresolved orders, no negative ledger); `paper` always starts a NEW session."""
+    from .modes import AUDIT_NAME, run_paths
+    from .modes.backtest import REFERENCE_RULES
+    from .portfolio import Portfolio
+    from .reporting import AuditLog
+    from .state import StateMachine, derive_state_explained
+    from .store import SqliteStore
+    from .types import Balance, BotState
+    cfg = ctx.config
+    rid, rdir, db = run_paths(cfg, Mode.PAPER, getattr(ctx.args, "run", None))
+    if rid is None or db is None or not db.is_file():
+        err(f"unstop: no paper run found under {cfg.state_path / 'paper'}")
+        return EXIT_REFUSED
+    try:
+        store = SqliteStore(db)
+    except InstanceLockError as exc:
+        err(f"unstop: {exc}")
+        return EXIT_REFUSED
+    try:
+        sm = StateMachine(store)
+        if sm.state is not BotState.STOPPED:
+            out(f"paper run {rid} is {sm.state.value}, not STOPPED: nothing to do.")
+            return EXIT_OK
+        pf = Portfolio(store, Decimal(str(store.kv_get(INITIAL_TMN_KEY) or cfg.initial_tmn)),
+                       btc_symbol=cfg.btc_symbol, usdt_symbol=cfg.usdt_symbol)
+        ledger = pf.expected_balances()
+        problems = [f"order {o.client_id} is {o.lifecycle.value}" for o in store.unresolved_orders()]
+        problems += [f"{a} ledger is negative ({plain(v)})" for a, v in ledger.items() if v < 0]
+        derived, why = derive_state_explained({a: Balance(a, v) for a, v in ledger.items() if v >= 0}, [],
+                                              REFERENCE_RULES, {}, btc_symbol=cfg.btc_symbol,
+                                              usdt_symbol=cfg.usdt_symbol)
+        if derived is BotState.STOPPED:
+            problems.append(f"no state can be derived: {why}")
+        out(_json({"run": rid, "ledger": ledger, "problems": problems, "derived_state": derived.value, "why": why,
+                   "note": "paper: ledger-only check (the session's simulated exchange no longer exists)"}))
+        if problems:
+            err("unstop REFUSED: see 'problems'. Nothing was changed.")
+            return EXIT_STOPPED
+        prev = store.kv_get("exec.stop")
+        with store.transaction():
+            sm.transition(derived, f"operator_unstop (paper, ledger-only): {why}", {"previous_stop": prev},
+                          force=True)
+            store.kv_set("exec.stop", None)
+            store.append("operator_unstop", {"to": derived.value, "previous_stop": prev, "why": why})
+        audit = AuditLog(rdir / AUDIT_NAME, run_id=rid, secrets=[cfg.api_key] if cfg.api_key else [])
+        try:
+            audit.write("operator_unstop", {"to": derived.value, "previous_stop": prev, "why": why})
+        finally:
+            audit.close()
+        out(f"unstopped paper run {rid}: STOPPED -> {derived.value}. `paper` always starts a NEW session; this "
+            "only repairs the stored state.")
+        return EXIT_OK
+    finally:
+        store.close()
+
+
 def cmd_report(ctx: Ctx) -> int:
     from .modes import mode_dir
     try:
@@ -780,6 +909,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mode", choices=[m.value for m in Mode],
                    help="ignored (kept for old scripts): --cancel-open acts on the live store whenever it exists")
     s.set_defaults(func=cmd_kill)
+
+    s = add("unstop", "leave STOPPED after a human check: read-only reconcile, then the true state",
+            "For a STOPPED live (or paper) ledger. Refuses while the KILL file exists (delete it yourself first). "
+            "Live needs --i-understand-real-money and the same gate evidence as `live --resume`, but uses a "
+            "READ-ONLY client: it re-runs the startup reconcile without sending anything, prints every drift "
+            "(asset, ledger, exchange, shortfall), and ONLY if nothing is unresolved, unexplained or short it "
+            "moves the ledger to the state the facts imply and audit-logs operator_unstop. It removes nothing "
+            "and never trades: start `live` afterwards. Exit 5 = reconcile not clean (nothing changed).")
+    s.add_argument("--mode", choices=[m.value for m in Mode], help="default: TRADING_MODE (paper)")
+    s.add_argument("--run", help="paper: run id (default: the last paper run)")
+    s.add_argument("--i-understand-real-money", action="store_true", help="required for live")
+    s.set_defaults(func=cmd_unstop)
 
     s = add("report", "rebuild the report from the store (offline) into final_report.rebuilt.json",
             "Rebuilds the final report offline from the run's store and writes final_report.rebuilt.json next "
