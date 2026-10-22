@@ -376,6 +376,7 @@ def cmd_selftest(ctx: Ctx) -> int:
     res = live_gate.run_selftest(ctx.config.state_path)
     out(_json({k: res.get(k) for k in ("passed", "tests", "failures", "reason", "source_hash", "at",
                                          "duration_s")}))
+    out(f"written: {ctx.config.state_path / live_gate.SELFTEST_FILE}")
     return EXIT_OK if res.get("passed") else EXIT_ERROR
 
 
@@ -397,6 +398,7 @@ def cmd_check_live(ctx: Ctx) -> int:
     out(_json({"checks": [{"name": c["name"], "ok": c["ok"]} for c in rep.checks],
                "attestation": {k: att[k] for k in ("ok", "at", "base_url", "failed_checks", "unverified",
                                                     "verified_by_canary", "reasons")}}))
+    out(f"written: {cfg.state_path / live_gate.ATTESTATION_FILE}")
     st = live_gate.arm_status(cfg, now=float(time.time() if ctx.clock is None else ctx.clock.now()))
     out("live gate still missing: " + (", ".join(st["missing"]) or "nothing (flag + phrase at launch)"))
     return EXIT_OK if att["ok"] else EXIT_GATE
@@ -528,6 +530,7 @@ def cmd_status(ctx: Ctx) -> int:
             snap.close()
     arm = live_gate.arm_status(replace(cfg, mode=Mode.LIVE), now=now)
     info["arm_status"] = {"missing": arm["missing"], "arming_file_present": arm["arming_file_present"],
+                          "arming": arm["arming"],
                           "unverified_api_items": arm["unverified_api_items"],
                           "canary_verified_api_items": arm["canary_verified_api_items"],
                           "required_at_launch": arm["required_at_launch"]}
