@@ -410,7 +410,8 @@ class AgentRunner:
         for s in syms:
             try:
                 b = ex.get_order_book(s)
-                ensure_fresh(b, now, cfg.max_book_age_s)
+                # freshness is judged at receipt: a slow proxy/network must not make a book 'future'
+                ensure_fresh(b, float(self.clock.now()), cfg.max_book_age_s)
                 books[s] = b
             except StaleQuote as exc:
                 unknown.append(f"book_stale:{s}")
@@ -418,6 +419,7 @@ class AgentRunner:
             except Exception as exc:  # noqa: BLE001
                 unknown.append(f"book:{s}")
                 errors[f"book:{s}"] = type(exc).__name__
+        now = float(self.clock.now())   # re-read AFTER the (possibly slow) fetches
         ledger = self.rt.portfolio.expected_balances()
         position = self.rt.portfolio.btc_position()
         equity = None

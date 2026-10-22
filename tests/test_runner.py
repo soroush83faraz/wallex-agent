@@ -245,3 +245,21 @@ def test_scripted_brain_is_a_real_brain(tmp_path):
     w = sim_world(tmp_path)
     rt = w.runtime(hold_script)
     assert isinstance(rt.brain, ScriptedBrain)
+
+
+def test_slow_book_fetches_do_not_make_books_look_future_stamped(tmp_path):
+    """Regression (found in a real paper run behind a slow proxy): each fetch takes seconds, books are
+    stamped at receipt, and the cycle's `now` was read before the fetches => 'stamped in the future'."""
+    w = sim_world(tmp_path)
+    real_get = w.source.get_book
+
+    def slow_get(symbol):
+        book = real_get(symbol)
+        w.clock.advance(3.0)            # network latency AFTER the receipt stamp
+        return book
+
+    w.source.get_book = slow_get
+    rt = w.runtime(trader_script())
+    run(rt, max_cycles=2)
+    obs = [x["payload"] for x in read_audit(rt.audit.path) if x["kind"] == "observe"]
+    assert obs and not any(u.startswith("book_stale") for o in obs for u in o["unknown"])
