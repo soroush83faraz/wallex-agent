@@ -53,14 +53,16 @@ Group=wallex-agent
 WorkingDirectory=/opt/wallex-agent
 EnvironmentFile=/etc/wallex-agent/wallex-agent.env
 Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-# PLACEHOLDER: final CLI flags are owned by cli.py. `--resume` must not prompt (no TTY here).
-# It takes the confirmation from the operator-created LIVE_ARMED file, then runs reconcile_startup.
+# `--resume` never prompts (no TTY here): it takes the confirmation from the operator-created
+# LIVE_ARMED file (`wallex-agent arm-live`), then runs reconcile_startup.
 ExecStart=/opt/wallex-agent/.venv/bin/wallex-agent live --resume --i-understand-real-money
 Restart=on-failure
 RestartSec=30
-# PLACEHOLDER: add the CLI's "live gate refused" / "kill switch" exit codes here, so systemd
-# does not keep retrying something that only an operator can fix, e.g.:
-# RestartPreventExitStatus=3 4
+# Exit codes only an operator can fix are never retried (see `wallex-agent --help`):
+# 3 live gate refused, 4 kill switch, 5 safety stop (STOPPED), 6 refused precondition.
+# 130 = stopped by SIGINT/SIGTERM (graceful, resumable): a clean stop, not a failure.
+RestartPreventExitStatus=3 4 5 6
+SuccessExitStatus=130
 KillSignal=SIGINT
 TimeoutStopSec=60
 KillMode=mixed

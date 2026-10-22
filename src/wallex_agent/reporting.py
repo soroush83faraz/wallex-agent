@@ -183,7 +183,10 @@ class AuditLog:
     """Append-only, hash-chained, fsync-per-line audit sink (``execution.AuditSink``)."""
 
     def __init__(self, path: str | Path, *, run_id: str, clock: Clock | None = None,
-                 strategy_version: str = STRATEGY_VERSION, secrets: Sequence[str] = ()) -> None:
+                 strategy_version: str = STRATEGY_VERSION, secrets: Sequence[str] = (),
+                 durable: bool = True) -> None:
+        # durable=False (backtest only: disposable simulated runs) skips the per-line fsync
+        self.durable = bool(durable)
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._scrub = Scrubber(secrets)
@@ -259,7 +262,8 @@ class AuditLog:
             line = (canonical_json(rec) + "\n").encode("utf-8")
             self._fh.write(line)
             self._fh.flush()
-            os.fsync(self._fh.fileno())
+            if self.durable:
+                os.fsync(self._fh.fileno())
             self.seq, self.last_hash = rec["seq"], rec["hash"]
 
     def close(self) -> None:
@@ -397,6 +401,8 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
     scored_holds = 0
     for ev in store.iter_events("decision"):
         p = ev.payload
+        if isinstance(p.get("decision"), Mapping):   # AgentMemory wraps it: {"decision": {...}, "points": ...}
+            p = p["decision"]
         action = str(p.get("action", "UNKNOWN"))
         actions[action] += 1
         for tc in p.get("tool_calls") or []:
