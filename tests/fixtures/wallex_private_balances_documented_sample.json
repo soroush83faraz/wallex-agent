@@ -1,0 +1,23 @@
+{
+  "_fixture": "DOCUMENTED SAMPLE, not a live capture. Copied from docs/wallex_official_api_reference_snapshot_2026-10-22.txt, GET /v1/account/balances (the '...' continuation removed).",
+  "success": true,
+  "message": "عملیات با موفقیت انجام شد",
+  "result": {
+    "balances": {
+      "TMN": {
+        "asset": "TMN",
+        "faName": "تومان",
+        "fiat": true,
+        "value": "10000000",
+        "locked": "0"
+      },
+      "USDT": {
+        "asset": "USDT",
+        "faName": "تتر",
+        "fiat": false,
+        "value": "10.00000000",
+        "locked": "0.00000000"
+      }
+    }
+  }
+}

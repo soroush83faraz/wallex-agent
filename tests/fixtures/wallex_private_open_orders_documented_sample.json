@@ -1,0 +1,25 @@
+{
+  "_fixture": "DOCUMENTED SAMPLE, not a live capture. GET /v1/account/openOrders from docs/wallex_official_api_reference_snapshot_2026-10-22.txt (the '...' continuation removed).",
+  "success": true,
+  "message": "عملیات با موفقیت انجام شد",
+  "result": {
+    "orders": [
+      {
+        "symbol": "BTCUSDT",
+        "type": "LIMIT",
+        "side": "BUY",
+        "price": "10000.000000",
+        "origQty": "0.001000",
+        "origSum": "10.000000",
+        "executedPrice": "62999995.0000000000000000",
+        "executedQty": "0.0000000000000000",
+        "executedSum": "0.0000000000000000",
+        "executedPercent": 0,
+        "status": "NEW",
+        "active": true,
+        "clientOrderId": "LIMIT-670f7c34-d609-40d3-b98e-0150640d79cb",
+        "created_at": "2022-06-18T13:45:08.000000Z"
+      }
+    ]
+  }
+}

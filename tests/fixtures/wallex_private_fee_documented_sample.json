@@ -1,0 +1,17 @@
+{
+  "_fixture": "DOCUMENTED SAMPLE, not a live capture. GET /v1/account/fee from docs/wallex_official_api_reference_snapshot_2026-10-22.txt. The official sample is NOT valid JSON (it opens a symbol->object mapping with '['); repaired here to the mapping form the docs text describes. Values unchanged.",
+  "success": true,
+  "message": "عملیات با موفقیت انجام شد",
+  "result": {
+    "BTCTMN": {
+      "makerFeeRate": "0.00200000",
+      "takerFeeRate": "0.00200000",
+      "recent_days_sum": 250000000.00
+    },
+    "BTCUSDT": {
+      "makerFeeRate": "0.00200000",
+      "takerFeeRate": "0.00200000",
+      "recent_days_sum": 0
+    }
+  }
+}
