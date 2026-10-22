@@ -53,10 +53,22 @@ def test_conversion_partial_fill_cancels_remainder_and_continues(tmp_path):
 
 
 def test_conversion_inspects_actual_balances(tmp_path):
-    # exchange holds less TMN than the ledger budget: only what is really there is converted
-    w = make_world(tmp_path, balances={"TMN": D("3000000"), "USDT": D(0), "BTC": D(0)})
+    # exchange holds MORE TMN than the ledger budget: only the bot's budget is converted
+    w = make_world(tmp_path, balances={"TMN": D("8000000"), "USDT": D(0), "BTC": D(0)})
     res = w.engine.convert_tmn_to_usdt()
-    assert res.status == "done" and res.tmn_spent <= D("3000000")
+    assert res.status == "done" and res.tmn_spent <= INITIAL and w.sim.total("TMN") > D("2900000")
+    # exchange holds LESS than the ledger says (M4: a shortfall): not a single order is sent, the
+    # bot is blocked at once and STOPPED once the shortfall is confirmed - with the numbers
+    w3 = make_world(tmp_path / "c", balances={"TMN": D("3000000"), "USDT": D(0), "BTC": D(0)})
+    res3 = w3.engine.convert_tmn_to_usdt()
+    assert w3.sim.order_count() == 0 and res3.status in ("declined", "nothing_to_convert", "blocked")
+    assert any("balance_shortfall_unconfirmed" in n for n in res3.notes), res3.notes
+    w3.clock.advance(60)
+    w3.engine.poll_and_manage()
+    assert w3.sm.state is S.STOPPED
+    reason = w3.engine.status()["stop"]["reason"]
+    assert reason.startswith("needs_manual_reconcile: ledger/exchange shortfall")
+    assert "TMN ledger 5000000 exchange 3000000 short 2000000" in reason
     # nothing convertible at all: no order, state stays UNFUNDED
     w2 = make_world(tmp_path / "b", balances={"TMN": D("40000"), "USDT": D(0), "BTC": D(0)})
     res2 = w2.engine.convert_tmn_to_usdt()

@@ -332,6 +332,10 @@ class AgentRunner:
         self.audit("reconcile", {"stage": "poll", **poll})
         self._report_order_progress()
         self._track_round_trips()
+        if self.sm.state is BotState.STOPPED:       # late accept, confirmed shortfall, contradiction
+            stop = self.store.kv_get("exec.stop") or {}
+            self.reason = f"engine stopped the bot: {stop.get('reason') or self._last_stop_reason()}"
+            return "stopped"
         # 3. observe
         view = self._observe()
         self._last_view = view
@@ -535,13 +539,12 @@ class AgentRunner:
         self.audit("tool_call", {"decision_id": decision_id, "name": name, "ok": status not in
                                  ("declined", "blocked", "rejected", "stopped"), "status": status,
                                  "order_ids": ids, "reason": reason})
-        # verify: re-read every order and the balances through the engine / exchange
-        poll = eng.poll_and_manage()
+        # verify: re-read every order and the balances through the engine / exchange. A shortfall
+        # blocks new orders at once and, confirmed on a later check, STOPS the bot (engine).
+        poll = eng.poll_and_manage(check_balances=False)
         recs = [self.store.get_order(i) for i in ids]
-        recon: dict[str, Any] = {"ok": None}
         try:
-            rr = self.rt.portfolio.reconcile(self.rt.exchange.get_balances(), eng.tolerance)
-            recon = {"ok": rr.ok, "reasons": rr.reasons, "excess": rr.excess}
+            recon: dict[str, Any] = eng.check_balances(stage="verify")
         except Exception as exc:  # noqa: BLE001
             recon = {"ok": None, "error": type(exc).__name__}
         filled = sum((r.executed_qty for r in recs if r), ZERO)

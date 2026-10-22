@@ -4,7 +4,7 @@ from decimal import Decimal as D
 
 import pytest
 
-from wallex_agent.execution import SimulatedCrash
+from wallex_agent.execution import QUARANTINE_MIN_CHECKS, SimulatedCrash
 from wallex_agent.types import BotState as S, OrderLifecycle as L, OrderRequest, Side
 
 from ._sim_support import BTC, funded_world, held_world, make_world
@@ -14,6 +14,16 @@ STAGES = ["after_intent", "after_sending", "after_post", "after_ack"]
 
 def alerts(w, name):
     return [p for p in w.audit.of("ALERT") if p.get("alert") == name]
+
+
+def lift_quarantine(w, eng, key=(BTC, Side.BUY)):
+    """M4: the quarantine needs QUARANTINE_MIN_CHECKS consecutive absent re-checks, each a full
+    resolve window apart: it is still there after every earlier one."""
+    for i in range(QUARANTINE_MIN_CHECKS):
+        assert key in eng.quarantined(), f"lifted after only {i} re-check(s)"
+        w.clock.advance(w.cfg.unknown_resolve_window_s + 1)
+        eng.poll_and_manage()
+    assert key not in eng.quarantined()
 
 
 @pytest.fixture
@@ -55,7 +65,7 @@ def test_crash_during_entry_never_duplicates(fw, stage):
         assert again.status == "filled"
     elif stage == "after_sending":
         assert again.status == "blocked" and "quarantined" in again.reason
-        w.clock.advance(w.cfg.unknown_resolve_window_s + 1)
+        lift_quarantine(w, eng)
         assert eng.submit(w.entry()).status == "filled"
         assert (BTC, Side.BUY) not in eng.quarantined()
     else:
@@ -134,11 +144,11 @@ def test_unknown_outcome_is_resolved_never_retried(tmp_path, kind, kw, expect):
     if expect == "abandoned":
         assert w.sm.state is S.READY and (BTC, Side.BUY) in w.engine.quarantined()
         assert w.store.get_order(r.order_ids[0]).lifecycle is L.ABANDONED
-        # quarantine: no new order on BTCUSDT BUY until a later re-check agrees
+        # quarantine: no new order on BTCUSDT BUY until repeated, spaced re-checks agree
         assert w.engine.submit(w.entry()).status == "blocked"
-        w.clock.advance(w.cfg.unknown_resolve_window_s)
-        w.engine.poll_and_manage()
+        lift_quarantine(w, w.engine)
         assert w.engine.quarantined() == frozenset() and "quarantine_lifted" in w.audit.kinds()
+        assert w.engine.watched_abandoned()[0].client_id == r.order_ids[0]      # still watched forever
         assert w.engine.submit(w.entry()).status == "filled"
     else:
         assert w.sm.state is S.BTC_HELD
@@ -206,7 +216,8 @@ def test_abandoned_order_appearing_later_stops_the_bot(tmp_path):
     w.sim.create_order(OrderRequest(rec.client_id, rec.symbol, rec.side, rec.price, rec.quantity))
     w.clock.advance(w.cfg.unknown_resolve_window_s)
     w.engine.poll_and_manage()
-    assert w.sm.state is S.STOPPED and alerts(w, "needs_manual_reconcile")
+    assert w.sm.state is S.STOPPED and alerts(w, "late_accept")
+    assert w.engine.status()["stop"]["reason"].startswith(f"late_accept: ABANDONED order {rec.client_id}")
 
 
 def test_unexplained_trades_after_abandon_stop_the_bot(tmp_path):
@@ -217,7 +228,8 @@ def test_unexplained_trades_after_abandon_stop_the_bot(tmp_path):
     w.clock.advance(w.cfg.unknown_resolve_window_s)
     w.engine.poll_and_manage()
     assert w.sm.state is S.STOPPED
-    assert "unexplained trades" in alerts(w, "needs_manual_reconcile")[-1]["reason"]
+    reason = alerts(w, "needs_manual_reconcile")[-1]["reason"]
+    assert "unexplained BUY trades on BTCUSDT" in reason and "0.0001 traded vs 0 recorded" in reason
 
 
 def test_alias_ids_are_stored_and_used(tmp_path):
@@ -275,7 +287,9 @@ def test_reconcile_startup_detects_drift(tmp_path):
     w.sim._total["BTC"] -= D("0.0001")                    # funds vanished: never explainable
     rep = w.restart().reconcile_startup()
     assert not rep["ok"] and w.sm.state is S.STOPPED
-    assert "drift" in alerts(w, "needs_manual_reconcile")[-1]["reason"]
+    reason = alerts(w, "needs_manual_reconcile")[-1]["reason"]
+    assert reason.startswith("ledger/exchange shortfall at startup:") and "short 0.0001" in reason
+    assert "BTC ledger " in w.engine.status()["stop"]["reason"]          # numbers in the stop reason
 
 
 def test_reconcile_startup_detects_unknown_open_order(tmp_path):

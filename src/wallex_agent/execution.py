@@ -8,6 +8,14 @@ Guarantees (each enforced here and tested with ``SimExchange`` fault injection):
   resolved from exchange facts (order lookups, open orders, trades, balance delta vs the snapshot);
   "not found anywhere and nothing moved" => ``ABANDONED`` + quarantine of that symbol/side; any
   contradiction => bot ``STOPPED`` (``needs_manual_reconcile``) with a loud audit record.
+* an ABANDONED order stays on a permanent watch list (derived from the persisted orders): on EVERY
+  poll, before every new order and at startup it is looked up again (by id, in the open orders, in
+  the trades); if it ever shows up (an exchange that accepted it late) => ALERT, cancel it (cancel
+  only), ``STOPPED`` (``late_accept``). Its quarantine is never lifted on absence alone: only after
+  ``QUARANTINE_MIN_CHECKS`` consecutive absent re-checks spanning ``QUARANTINE_MIN_CHECKS`` x
+  ``unknown_resolve_window_s``.
+* in-run ledger vs exchange: a balance shortfall beyond tolerance with no order of ours in flight
+  blocks new orders at once and, confirmed on a later check, STOPS the bot with the numbers.
 * fills are recorded only from observed ``executed_qty`` increases; fees come from matching
   ``get_trades`` rows, else are estimated and flagged ``fee_source='estimated'``.
 * bot state transitions follow observed facts; ``*_PENDING`` only while an order is in flight/active.
@@ -44,11 +52,34 @@ K_ATTRIBUTED = "exec.attributed_trades"
 K_PRESEND = "exec.presend."
 K_MISSING = "exec.not_found."
 K_STOP = "exec.stop"
+K_SHORTFALL = "exec.shortfall_suspect"
 DEFAULT_TOLERANCE: dict[str, Decimal] = {"BTC": Decimal("0.0000001"), "USDT": Decimal("0.01"),
                                          "TMN": Decimal("10")}
 TRADE_TIME_SKEW_S = 120.0
 MAX_NOT_FOUND = 3
 MAX_ATTRIBUTED_KEPT = 5000
+QUARANTINE_MIN_CHECKS = 3          # absent re-checks (each >= unknown_resolve_window_s apart) to lift
+SHORTFALL_CONFIRM_S = 15.0         # a balance shortfall must persist this long (2nd check) to STOP
+
+
+def drift_text(rr: Any) -> str:
+    """``TMN ledger 5000000 exchange 4999989 short 11`` for every SHORT asset of a ReconcileReport."""
+    parts = []
+    for a, d in sorted(getattr(rr, "drifts", {}).items()):
+        if d.direction != "short":
+            continue
+        actual = d.actual_value + (d.actual_locked if d.interpretation == "value+locked" else ZERO)
+        parts.append(f"{a} ledger {plain(d.expected)} exchange {plain(actual)} short {plain(-d.drift)}")
+    if not parts:
+        parts = [str(r) for r in getattr(rr, "reasons", [])]
+    return "; ".join(parts)
+
+
+def _brief(evidence: Mapping[str, Any], limit: int = 240) -> str:
+    """Compact one-line rendering of contradiction evidence for the human-readable stop reason."""
+    text = "; ".join(f"{k}={v}" for k, v in jsonable(dict(evidence)).items()
+                     if k not in ("info", "found") and v not in (None, "", [], {}))
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 _STATUS = {L.FILLED: "filled", L.PARTIAL: "partial", L.OPEN: "open", L.CANCELED: "canceled",
            L.REJECTED: "rejected", L.ABANDONED: "abandoned", L.UNKNOWN_OUTCOME: "unknown",
@@ -319,52 +350,199 @@ class ExecutionEngine:
         q = dict(self.store.kv_get(K_QUARANTINE, {}) or {})
         q[f"{rec.symbol}:{rec.side.value}"] = {
             "symbol": rec.symbol, "side": rec.side.value, "client_id": rec.client_id,
-            "ids": [i for i in (rec.client_id, rec.exchange_client_order_id) if i], "since": self._now()}
+            "ids": [i for i in (rec.client_id, rec.exchange_client_order_id) if i], "since": self._now(),
+            "absent_checks": 0, "last_check_ts": None}
         self.store.kv_set(K_QUARANTINE, q)
 
-    def _recheck_quarantine(self, key: str) -> bool:
-        """True when the quarantine was lifted (a later re-check agrees the order never existed)."""
-        q = dict(self.store.kv_get(K_QUARANTINE, {}) or {})
-        e = q.get(key)
-        if e is None:
-            return True
-        if self._now() - float(e["since"]) < self.config.unknown_resolve_window_s:
-            return False
-        info, ok = self._find_order(e["ids"], e["symbol"])
-        if info is not None:
-            self._contradiction("abandoned order exists on the exchange",
-                                {"client_id": e["client_id"], "found": _info_dict(info)})
-            return False
-        if not ok:
-            return False
-        snap = self.store.kv_get(K_PRESEND + e["client_id"]) or {}
-        side = Side(e["side"])
+    # ------------------------------------------------------------------ abandoned-order watch list
+    def watched_abandoned(self) -> list[OrderRecord]:
+        """Every ABANDONED order that was ever handed to the exchange (it has a pre-send snapshot).
+        Derived from the persisted orders, so the list is permanent and survives restarts."""
+        return [r for r in self.store.list_orders([L.ABANDONED])
+                if self.store.kv_get(K_PRESEND + r.client_id) is not None]
+
+    def _unexplained_trades(self, rec: OrderRecord) -> tuple[str, dict[str, Any]]:
+        """('ok'|'moved'|'unknown'|'skipped', numbers): trades on the order's symbol/side since its
+        pre-send snapshot vs the fills we recorded since then."""
+        if any(o.symbol == rec.symbol and o.side is rec.side for o in self.store.unresolved_orders()):
+            return "skipped", {}          # one of OUR orders is in flight there: its fills are not final
+        snap = self.store.kv_get(K_PRESEND + rec.client_id) or {}
         try:
-            trades = self.exchange.get_trades(e["symbol"], side)
+            trades = self.exchange.get_trades(rec.symbol, rec.side)
         except Exception:
-            return False
+            return "unknown", {}
         pre = set(snap.get("trade_keys", []))
         new_qty = sum((t.quantity for k, t in trade_keys(trades) if k not in pre), ZERO)
-        since = float(snap.get("ts", e["since"]))
+        since = float(snap.get("ts", rec.created_ts or 0.0))
         recorded = sum((f.quantity for f in self.store.list_fills()
-                        if f.symbol == e["symbol"] and f.side is side and f.ts >= since), ZERO)
+                        if f.symbol == rec.symbol and f.side is rec.side and f.ts >= since), ZERO)
         if new_qty > recorded:
-            self._contradiction("unexplained trades after an abandoned order",
-                                {"client_id": e["client_id"], "new_trade_qty": new_qty, "recorded": recorded})
-            return False
-        q.pop(key, None)
-        self.store.kv_set(K_QUARANTINE, q)
-        self._audit("quarantine_lifted", {"key": key, "client_id": e["client_id"]})
+            return "moved", {"new_trade_qty": new_qty, "recorded_fill_qty": recorded}
+        return "ok", {}
+
+    def check_abandoned(self, *, stage: str) -> bool | None:
+        """Re-check every watched ABANDONED order. True: all still absent; False: one appeared or
+        something unexplained happened (the bot is now STOPPED); None: could not verify (a read
+        failed) - callers must not send a new order then. Also counts quarantine re-checks."""
+        watched = self.watched_abandoned()
+        if not watched:
+            return True
+        unverified: set[str] = set()
+        for rec in watched:
+            info, ok = self._find_order([rec.client_id, rec.exchange_client_order_id or ""], rec.symbol)
+            if info is not None:
+                self._late_accept(rec, info, stage=stage)
+                return False
+            status, numbers = self._unexplained_trades(rec)
+            if status == "moved":
+                self._contradiction(
+                    f"unexplained {rec.side.value} trades on {rec.symbol} after ABANDONED order {rec.client_id}: "
+                    f"{plain(numbers['new_trade_qty'])} traded vs {plain(numbers['recorded_fill_qty'])} recorded "
+                    "(possible late accept of that order)", {"client_id": rec.client_id, **numbers, "stage": stage})
+                return False
+            if not ok or status == "unknown":
+                unverified.add(rec.client_id)
+        for sym in sorted({r.symbol for r in watched}):
+            try:
+                opens = list(self.exchange.list_open_orders(sym))
+            except Exception:
+                unverified |= {r.client_id for r in watched if r.symbol == sym}
+                continue
+            for o in opens:
+                known = self.store.find_order_by_exchange_id(o.client_order_id)
+                if known is None or known.is_terminal:
+                    cids = ",".join(r.client_id for r in watched if r.symbol == sym)
+                    self._contradiction(
+                        f"open order {o.client_order_id} ({o.side.value} {plain(o.orig_qty)} {o.symbol} @ "
+                        f"{plain(o.price)}) is unknown to the store while ABANDONED order(s) {cids} are watched "
+                        "(possible late accept: if it is ours, cancel it in the Wallex app)",
+                        {"exchange_id": o.client_order_id, "stage": stage, "info": _info_dict(o)})
+                    return False
+        self._count_quarantine_checks(unverified)
+        if unverified:
+            self._audit("abandoned_watch_unverified", {"stage": stage, "client_ids": sorted(unverified)})
+            return None
         return True
 
+    def _count_quarantine_checks(self, unverified: set[str]) -> None:
+        """A quarantine is lifted only after QUARANTINE_MIN_CHECKS consecutive verified-absent
+        re-checks, each >= unknown_resolve_window_s after the previous one (and after the abandon),
+        i.e. never on one look and never sooner than QUARANTINE_MIN_CHECKS x the window."""
+        q = dict(self.store.kv_get(K_QUARANTINE, {}) or {})
+        if not q:
+            return
+        now, window = self._now(), float(self.config.unknown_resolve_window_s)
+        changed = False
+        for key, e in list(q.items()):
+            if e.get("client_id") in unverified:
+                if e.get("absent_checks"):
+                    e["absent_checks"], changed = 0, True       # not consecutive any more
+                continue
+            last = e.get("last_check_ts")
+            if now - float(e["since"]) < window or (last is not None and now - float(last) < window):
+                continue
+            e["absent_checks"] = int(e.get("absent_checks") or 0) + 1
+            e["last_check_ts"] = now
+            changed = True
+            if e["absent_checks"] >= QUARANTINE_MIN_CHECKS and now - float(e["since"]) >= QUARANTINE_MIN_CHECKS * window:
+                q.pop(key)
+                self._audit("quarantine_lifted", {"key": key, "client_id": e["client_id"],
+                                                  "absent_checks": e["absent_checks"],
+                                                  "span_s": round(now - float(e["since"]), 3),
+                                                  "still_watched": True})
+        if changed:
+            self.store.kv_set(K_QUARANTINE, q)
+
+    def _late_accept(self, rec: OrderRecord, info: OrderInfo, *, stage: str) -> None:
+        """An ABANDONED order exists on the exchange after all: cancel it (cancel only) and STOP with
+        the ledger/exchange numbers it explains. Its fills cannot be adopted (the record is final)."""
+        oid = info.client_order_id or rec.client_id
+        cancel = "not needed (not active)"
+        if info.active:
+            try:
+                self.exchange.cancel_order(oid)
+                cancel = "requested"
+            except Exception as exc:  # noqa: BLE001 - reported, the stop happens anyway
+                cancel = f"FAILED ({type(exc).__name__}): cancel it in the Wallex app"
+            try:
+                after = self.exchange.get_order(oid)
+                info = after
+                cancel += f"; now {'ACTIVE' if after.active else 'inactive'}"
+            except Exception as exc:  # noqa: BLE001
+                cancel += f"; not verified ({type(exc).__name__})"
+        base, quote = self._pair(rec.symbol)
+        numbers = self._ledger_vs_exchange((base, quote))
+        reason = (f"late_accept: ABANDONED order {rec.client_id} ({rec.side.value} {plain(rec.quantity)} {rec.symbol} "
+                  f"@ {plain(rec.price)}) exists on the exchange ({info.status.value}, executed "
+                  f"{plain(info.executed_qty)} {base} for {plain(info.executed_sum)} {quote}); cancel {cancel}; "
+                  f"ledger vs exchange: {numbers}. The difference is that order's execution (fee not included)")
+        evidence = {"client_id": rec.client_id, "stage": stage, "found": _info_dict(info), "cancel": cancel}
+        self._alert("late_accept", {"reason": reason, "evidence": jsonable(evidence)})
+        self._stop(reason, evidence)
+
+    def _ledger_vs_exchange(self, assets: Iterable[str]) -> str:
+        ledger = self.portfolio.expected_balances()
+        try:
+            bals = dict(self.exchange.get_balances())
+        except Exception as exc:  # noqa: BLE001
+            return f"exchange balances unavailable ({type(exc).__name__}); ledger " + ", ".join(
+                f"{a} {plain(ledger.get(a, ZERO))}" for a in assets)
+        parts = []
+        for a in assets:
+            b = bals.get(a)
+            parts.append(f"{a} ledger {plain(ledger.get(a, ZERO))} exchange {plain(b.value if b else ZERO)}"
+                         + (f" (locked {plain(b.locked)})" if b and b.locked else ""))
+        return "; ".join(parts)
+
+    # ------------------------------------------------------------------ in-run balance check
+    def check_balances(self, *, stage: str) -> dict[str, Any]:
+        """Ledger vs exchange during the run. With no order of ours in flight, a shortfall beyond
+        tolerance blocks every new order at once and - still there on a check at least
+        ``SHORTFALL_CONFIRM_S`` later (balances may settle a moment after a fill) - STOPS the bot
+        (``needs_manual_reconcile`` with the numbers), exactly like the startup check."""
+        if self.sm.state is BotState.STOPPED:
+            return {"ok": None, "skipped": "bot STOPPED"}
+        if self.store.unresolved_orders():
+            return {"ok": None, "skipped": "orders in flight"}
+        try:
+            bals = self._balances()
+        except _Decline as d:
+            return {"ok": None, "error": str(d)}
+        rr = self.portfolio.reconcile(bals, self.tolerance, locked_semantics="unknown")
+        out: dict[str, Any] = {"ok": rr.ok, "reasons": rr.reasons, "excess": rr.excess, "stage": stage}
+        suspect = self.store.kv_get(K_SHORTFALL)
+        if rr.ok:
+            if suspect:
+                self.store.kv_set(K_SHORTFALL, None)
+                self._audit("balance_shortfall_cleared", {"stage": stage, "was": suspect})
+            return out
+        text = drift_text(rr)
+        now = self._now()
+        if not suspect:
+            self.store.kv_set(K_SHORTFALL, {"since": now, "text": text, "stage": stage})
+            self._alert("balance_shortfall_suspected", {"reason": text, "stage": stage,
+                                                        "note": "no new order until re-checked"})
+            out["confirmed"] = False
+            return out
+        if now - float(suspect.get("since", now)) < SHORTFALL_CONFIRM_S:
+            out["confirmed"] = False
+            return out
+        self._contradiction(f"ledger/exchange shortfall: {text}",
+                            {"reasons": rr.reasons, "stage": stage, "first_seen": suspect.get("since")})
+        out["confirmed"] = True
+        return out
+
     # ------------------------------------------------------------------ contradictions
+    def _stop(self, reason: str, evidence: Mapping[str, Any]) -> None:
+        ev = jsonable(dict(evidence))
+        self.store.kv_set(K_STOP, {"reason": reason, "ts": self._now(), "evidence": ev})
+        if self.sm.state is not BotState.STOPPED:
+            self.sm.transition(BotState.STOPPED, reason[:500], ev)
+
     def _contradiction(self, reason: str, evidence: Mapping[str, Any]) -> None:
         ev = jsonable(dict(evidence))
         self._alert("needs_manual_reconcile", {"reason": reason, "evidence": ev})
-        self.store.kv_set(K_STOP, {"reason": f"needs_manual_reconcile: {reason}", "ts": self._now(),
-                                   "evidence": ev})
-        if self.sm.state is not BotState.STOPPED:
-            self.sm.transition(BotState.STOPPED, f"needs_manual_reconcile: {reason}", ev)
+        self._stop(f"needs_manual_reconcile: {reason}", ev)
 
     # ------------------------------------------------------------------ planning
     def _state_problem(self, intent: TradeIntent) -> str | None:
@@ -397,11 +575,17 @@ class ExecutionEngine:
             return "bot_stopped"
         if self.store.unresolved_orders():
             return "unresolved_orders"
+        watch = self.check_abandoned(stage="pre_send")      # a late accept must never meet a new order
+        if self.sm.state is BotState.STOPPED:
+            return f"bot_stopped: {str((self.store.kv_get(K_STOP) or {}).get('reason', ''))[:200]}"
+        if watch is None:
+            return ("abandoned_watch_unverified: an ABANDONED order could not be re-checked (exchange read "
+                    "failed); no new order until it can be")
         if (intent.symbol, intent.side) in self.quarantined():
-            if not self._recheck_quarantine(f"{intent.symbol}:{intent.side.value}"):
-                return f"quarantined: {intent.symbol} {intent.side.value} after an unknown outcome"
-            if self.sm.state is BotState.STOPPED:
-                return "bot_stopped"
+            return f"quarantined: {intent.symbol} {intent.side.value} after an unknown outcome"
+        suspect = self.store.kv_get(K_SHORTFALL)
+        if suspect:
+            return f"balance_shortfall_unconfirmed: {suspect.get('text')}"
         return self._state_problem(intent)
 
     def _plan(self, intent: TradeIntent, adj: _Adjust) -> _Plan:
@@ -643,7 +827,8 @@ class ExecutionEngine:
         if not problems and target is not rec.lifecycle and target not in ORDER_TRANSITIONS[rec.lifecycle]:
             problems.append(f"illegal lifecycle {rec.lifecycle.value} -> {target.value}")
         if problems:
-            self._contradiction("exchange order contradicts local record",
+            self._contradiction(f"exchange order {cid} contradicts the local record ({source}): "
+                                + "; ".join(problems),
                                 {"client_id": cid, "source": source, "problems": problems,
                                  "info": _info_dict(info)})
             return rec
@@ -692,7 +877,7 @@ class ExecutionEngine:
                 if self.store.kv_get(K_MISSING + cid):
                     self.store.kv_set(K_MISSING + cid, 0)
         except InvariantError as exc:
-            self._contradiction("recording exchange facts violated an invariant",
+            self._contradiction(f"recording exchange facts for {cid} violated an invariant: {str(exc)[:200]}",
                                 {"client_id": cid, "error": str(exc), "info": _info_dict(info)})
             return self.store.get_order(cid)
         new = self.store.get_order(cid)
@@ -819,10 +1004,11 @@ class ExecutionEngine:
         if adopt_only:
             return "unresolved"
         if snap is None:
-            self._contradiction("unknown outcome without a pre-send snapshot", {"client_id": cid})
+            self._contradiction(f"unknown outcome of {cid} without a pre-send snapshot", {"client_id": cid})
             return "stopped"
         if changed is not None:
-            self._contradiction("order not found but balances/trades moved", {"client_id": cid, "changes": changed})
+            self._contradiction(f"order {cid} not found but balances/trades moved: {_brief(changed)}",
+                                {"client_id": cid, "changes": changed})
             return "stopped"
         if consistent >= (2 if window > 0 else 1):
             with self.store.transaction():
@@ -858,7 +1044,9 @@ class ExecutionEngine:
                 return self._apply_info(rec.client_id, info, source="open_orders")
             self._audit("order_not_found", {"client_id": rec.client_id, "count": n})
             if n >= MAX_NOT_FOUND:
-                self._contradiction("acknowledged order repeatedly not found", {"client_id": rec.client_id, "count": n})
+                self._contradiction(f"acknowledged order {rec.client_id} ({rec.side.value} {plain(rec.quantity)} "
+                                    f"{rec.symbol}) not found {n} times in a row",
+                                    {"client_id": rec.client_id, "count": n})
             return rec
         except Exception as exc:
             self._audit("read_failed", {"client_id": rec.client_id, "op": "get_order", "error": type(exc).__name__})
@@ -915,9 +1103,10 @@ class ExecutionEngine:
         self._audit("cancel_open_orders", out)
         return out
 
-    def poll_and_manage(self) -> dict[str, Any]:
+    def poll_and_manage(self, *, check_balances: bool = True) -> dict[str, Any]:
         """Refresh every unresolved order from the exchange, record fills, cancel timed-out orders
-        (and verify), re-check quarantines, then settle the bot state from the facts."""
+        (and verify), re-check every watched ABANDONED order (and count quarantine re-checks), settle
+        the bot state from the facts, then (``check_balances``) compare the ledger with the exchange."""
         fills_before = self.store.count_fills()
         report: dict[str, Any] = {"checked": 0, "cancel_attempts": [], "fills": 0}
         now = self._now()
@@ -931,9 +1120,11 @@ class ExecutionEngine:
             if rec.lifecycle in (L.OPEN, L.PARTIAL) and now - float(rec.created_ts or now) >= self.config.order_timeout_s:
                 report["cancel_attempts"].append(rec.client_id)
                 self._cancel_and_verify(rec)
-        for key in list((self.store.kv_get(K_QUARANTINE, {}) or {}).keys()):
-            self._recheck_quarantine(key)
+        if self.sm.state is not BotState.STOPPED:
+            report["abandoned_watch"] = self.check_abandoned(stage="poll")
         self._settle_state()
+        if check_balances:
+            report["balances"] = self.check_balances(stage="poll")
         report["fills"] = self.store.count_fills() - fills_before
         report["state"] = self.sm.state.value
         self._last_poll_ts = now
@@ -1086,8 +1277,11 @@ class ExecutionEngine:
         """Resolve every unresolved order against the exchange, look for unknown open orders, compare
         the fill ledger with real balances and confirm the bot state. Unexplained drift => STOPPED."""
         report: dict[str, Any] = {"ok": False, "actions": [], "drift": None}
-        report["poll"] = self.poll_and_manage()
+        report["poll"] = self.poll_and_manage(check_balances=False)    # the strict check is below
         cfg = self.config
+        if report["poll"].get("abandoned_watch") is None and self.sm.state is not BotState.STOPPED:
+            report["actions"].append("abandoned_watch_unverified: an ABANDONED order could not be re-checked")
+            return report
         try:
             opens = [o for o in self.exchange.list_open_orders()
                      if o.symbol in (cfg.btc_symbol, cfg.usdt_symbol)]
@@ -1097,17 +1291,20 @@ class ExecutionEngine:
         for o in opens:
             rec = self.store.find_order_by_exchange_id(o.client_order_id)
             if rec is None or rec.is_terminal:
-                self._contradiction("open order on the exchange unknown to (or closed in) the store",
-                                    {"exchange_id": o.client_order_id, "info": _info_dict(o)})
+                self._contradiction(
+                    f"open order {o.client_order_id} ({o.side.value} {plain(o.orig_qty)} {o.symbol} @ "
+                    f"{plain(o.price)}) on the exchange is unknown to (or closed in) the store",
+                    {"exchange_id": o.client_order_id, "info": _info_dict(o)})
         try:
             bals = self._balances()
         except _Decline as d:
             report["actions"].append(str(d))
             return report
         rr = self.portfolio.reconcile(bals, self.tolerance, locked_semantics="unknown")
-        report["drift"] = {"ok": rr.ok, "reasons": rr.reasons, "excess": rr.excess, "anomalies": rr.anomalies}
+        report["drift"] = {"ok": rr.ok, "reasons": rr.reasons, "excess": rr.excess, "anomalies": rr.anomalies,
+                           "text": drift_text(rr) if not rr.ok else ""}
         if not rr.ok:
-            self._contradiction("unexplained drift between fill ledger and exchange balances",
+            self._contradiction(f"ledger/exchange shortfall at startup: {drift_text(rr)}",
                                 {"reasons": rr.reasons})
         if self.sm.state is not BotState.STOPPED:
             try:
@@ -1133,7 +1330,8 @@ class ExecutionEngine:
                     self.sm.transition(BotState.READY, f"restart: {why}", {"derived": derived.value})
                     report["actions"].append("UNFUNDED -> READY")
                 else:
-                    self._contradiction("persisted bot state disagrees with ledger-derived state",
+                    self._contradiction(f"persisted bot state {cur.value} disagrees with the ledger-derived "
+                                        f"state {derived.value} ({why})",
                                         {"persisted": cur.value, "derived": derived.value, "why": why})
         report["state"] = self.sm.state.value
         report["ok"] = self.sm.state is not BotState.STOPPED and rr.ok
@@ -1157,6 +1355,8 @@ class ExecutionEngine:
             "stop": self.store.kv_get(K_STOP), "run_id": self.run_id,
             "orders_by_lifecycle": dict(counts), "unresolved": unresolved,
             "quarantine": sorted(q.keys()), "fills": len(fills),
+            "abandoned_watch": [r.client_id for r in self.watched_abandoned()],
+            "balance_shortfall_suspect": self.store.kv_get(K_SHORTFALL),
             "estimated_fee_fills": sum(1 for f in fills if f.fee_source == "estimated"),
             "ledger": self.portfolio.expected_balances(), "fees_paid": self.portfolio.fees_paid(),
             "posts_this_process": self.posts, "last_poll_ts": self._last_poll_ts})
