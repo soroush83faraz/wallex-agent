@@ -87,8 +87,14 @@ def test_report_status_trace_after_a_backtest(capsys, tmp_path):
     st = json.loads(out)
     assert code == 0 and st["state"] == "STOPPED" and st["open_orders"] == [] and st["time_left_h"] == 0.0
     assert "arm_status" in st and SENTINEL not in out
+    runs = list((tmp_path / "state" / "backtest" / "runs").glob("*/final_report.json"))
+    assert len(runs) == 1
+    original = runs[0].read_bytes()
     code, out, _ = run_cli(capsys, ["report", "--mode", "backtest"], tmp_path)
-    assert code == 0 and "final_report.json" in out and '"value"' in out
+    assert code == 0 and "final_report.rebuilt.json" in out and '"value"' in out
+    assert runs[0].read_bytes() == original                    # F3: the runner's report is untouched
+    rebuilt = json.loads((runs[0].parent / "final_report.rebuilt.json").read_text(encoding="utf-8"))
+    assert rebuilt["clock"] == "simulated" and "simulated_clock" in rebuilt["labels"]
     code, out, _ = run_cli(capsys, ["trace", "--mode", "backtest", "--last", "2"], tmp_path)
     assert code == 0 and out.startswith("Audit trace") and "OBSERVE" in out
 
@@ -298,6 +304,36 @@ def test_kill_cancel_open_acts_on_live_whenever_the_live_store_exists(capsys, tm
     # without the key the live cancel path refuses loudly instead of pretending
     code, out, err = run_cli(capsys, ["kill", "--cancel-open"], tmp_path, env={"DATA_DIR": str(sd)})
     assert code == EXIT_REFUSED and "WALLEX_API_KEY" in err
+
+
+# --------------------------------------------------------------------------- summary texts (F3)
+def _summary(capsys, tmp_path, mode, verified):
+    from types import SimpleNamespace
+    from wallex_agent.config import Config
+    from wallex_agent.reporting import AuditLog
+    from wallex_agent.runner import RunResult
+    from wallex_agent.types import Mode
+    log = AuditLog(tmp_path / f"a-{mode}-{verified}.jsonl", run_id="r", clock=SimClock(1_700_000_000.0))
+    log.write("observe", {})
+    log.close()
+    rt = SimpleNamespace(mode=Mode(mode), run_id="live-x", config=Config(), audit=log)
+    rep = {"labels": [], "value": {"initial_tmn": "5000000", "final_tmn_net_of_exit_costs": "5100000",
+                                   "verified_against_exchange": verified,
+                                   "exchange_check": {"detail": "exchange balances unavailable (TransportError)"}},
+           "pnl": {"abs_tmn": "100000", "pct": "2", "target_statement": "Target 2x NOT reached"},
+           "end": {"holdings": {"USDT": "18.1"}}}
+    cli.print_summary(RunResult("deadline", 0, 3, "deadline", report=rep), rt, "TITLE")
+    return capsys.readouterr().out
+
+
+def test_live_summary_is_not_simulated_and_flags_an_unverified_value(capsys, tmp_path):
+    out = _summary(capsys, tmp_path, "live", None)
+    assert "Past (simulated)" not in out and "REAL-MONEY run" in out
+    assert "LEDGER-BASED, NOT verified against the exchange balances" in out and "(unverified)" in out
+    out = _summary(capsys, tmp_path, "live", True)
+    assert "NOT verified" not in out and "confirmed against the exchange balances" in out
+    out = _summary(capsys, tmp_path, "paper", None)
+    assert "Past (simulated) results" in out and "REAL-MONEY" not in out and "NOT verified" not in out
 
 
 # --------------------------------------------------------------------------- signals

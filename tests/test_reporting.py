@@ -352,6 +352,37 @@ def test_report_live_mode_and_unknown_fee(tmp_path):
     assert any("This run was LIVE" in c for c in rep["honest_caveats"])
 
 
+def test_report_strategy_comes_from_the_hypothesis_strategy_key(tmp_path):
+    """F1: the planner stores the strategy under hypothesis['strategy'] (not 'name')."""
+    w = make_world(tmp_path)
+    assert w.engine.convert_tmn_to_usdt(decision_id="d-9").status == "done"
+    w.store.append("decision", {"decision": {"decision_id": "d-9", "action": "CONVERT_TMN_USDT",
+                                             "hypothesis": {"strategy": "convert"}, "chosen_tool": "fx_check",
+                                             "alternatives": [{"strategy": "convert_wait"}],
+                                             "state_features": {"state": "UNFUNDED"}, "ts": 1_700_000_000.0},
+                                "context": {"ledger": {"TMN": "5000000"}, "equity_tmn_net": "5000000",
+                                            "peak_equity_tmn": "5000000", "drawdown_pct": "0"}})
+    rep = report_for(w)
+    (d,) = rep["round_trips"]["decisions"]
+    assert d["strategy"] == "convert" and d["chosen_tool"] == "fx_check" and d["alternatives"]
+    assert d["order_ids"] and d["fills"] and d["balances"]["ledger"] == {"TMN": "5000000"}
+    assert rep["orders_without_decision"] == []
+
+
+def test_live_report_flags_an_unverified_valuation(tmp_path):
+    """F3: a live report must not present the ledger valuation as fact if the exchange could not
+    confirm it at the end."""
+    w = run_scenario(tmp_path)
+    rep = report_for(w, mode=Mode.LIVE, synthetic_data=False,
+                     exchange_check={"verified": None, "detail": "exchange balances unavailable (TransportError)"})
+    assert "valuation_unverified" in rep["labels"] and rep["value"]["verified_against_exchange"] is None
+    assert any("NOT verified against the exchange" in c for c in rep["honest_caveats"])
+    ok = report_for(w, mode=Mode.LIVE, synthetic_data=False, exchange_check={"verified": True, "detail": ""})
+    assert "valuation_unverified" not in ok["labels"] and ok["value"]["verified_against_exchange"] is True
+    paper = report_for(w)
+    assert paper["value"]["verified_against_exchange"] is None and paper["clock"] == "real"
+
+
 def test_report_flags_flatten_policy_with_btc_left(tmp_path):
     w = make_world(tmp_path, final_policy="flatten_to_tmn")
     assert w.engine.convert_tmn_to_usdt().status == "done"

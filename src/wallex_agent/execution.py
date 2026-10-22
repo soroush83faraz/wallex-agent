@@ -293,6 +293,9 @@ class ExecutionEngine:
                 elif not rec.is_terminal:
                     out["unresolved"].append(rec.client_id)
         if self.sm.state is not BotState.STOPPED:
+            self.store.kv_set(K_STOP, {"reason": f"kill: {reason} (cancelled {len(out['cancelled'])}, still open "
+                                                 f"{len(out['still_open'])}, unresolved {len(out['unresolved'])})",
+                                       "ts": self._now(), "kill": True})
             self.sm.transition(BotState.STOPPED, f"kill: {reason}", {"cancel_open": cancel_open})
         self._alert("kill", {"reason": reason, **out})
         return out

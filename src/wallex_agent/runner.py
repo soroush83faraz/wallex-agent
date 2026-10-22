@@ -311,6 +311,7 @@ class AgentRunner:
             self._safe_audit("alert", {"alert": "cancel_failed", "error": type(exc).__name__})
         try:
             if self.sm.state is not BotState.STOPPED:
+                self.store.kv_set("exec.stop", {"reason": f"safety stop: {reason}", "ts": float(self.clock.now())})
                 self.sm.transition(BotState.STOPPED, f"safety stop: {reason}")
         except Exception as exc:  # noqa: BLE001
             self._safe_audit("alert", {"alert": "stop_transition_failed", "error": type(exc).__name__})
@@ -378,7 +379,7 @@ class AgentRunner:
                 blocked = "shutdown requested"
         d.risk_verdict = None if verdict is None else {**verdict.to_dict(), "intent_source": source,
                                                        "blocked": blocked}
-        self.brain.record_decision(d)
+        self.brain.record_decision(d, context=self._decision_context(view, source if intent is not None else None))
         self._audit_decision(d, forced, verdict, blocked, view)
         # 6. act -> verify
         if verdict is not None and verdict.approved and blocked is None and verdict.adjusted is not None:
@@ -388,7 +389,11 @@ class AgentRunner:
                 return st
         # drawdown breach while flat => exits only were possible; now stop
         if self._drawdown_breached(view) and self.sm.state is BotState.READY:
-            self.reason = f"drawdown >= {self.cfg.max_drawdown_pct} with no position: STOPPED"
+            dd = (view.peak - view.equity) / view.peak if view.equity is not None and view.peak > 0 else None
+            self.reason = (f"drawdown {plain((dd or ZERO) * 100)}% >= {plain(self.cfg.max_drawdown_pct * 100)}% "
+                           f"(equity {plain(view.equity) if view.equity is not None else '?'} TMN net vs peak "
+                           f"{plain(view.peak)} TMN) with no position: STOPPED")
+            self.store.kv_set("exec.stop", {"reason": self.reason, "ts": view.now})
             self.sm.transition(BotState.STOPPED, self.reason)
             return "stopped"
         # 7. reflect + equity
@@ -501,6 +506,17 @@ class AgentRunner:
             kill=self.engine.kill_requested(), unresolved_orders=bool(self.store.unresolved_orders()),
             quarantined=self.engine.quarantined())
 
+    def _decision_context(self, view: _View, intent_source: str | None) -> dict[str, Any]:
+        """Balances, equity and drawdown at decision time (F1: reported with every decision)."""
+        dd = None
+        if view.equity is not None and view.peak > 0:
+            dd = max(ZERO, (view.peak - view.equity) / view.peak * 100).quantize(Decimal("0.0001"))
+        return {"state": self.sm.state.value, "ledger": view.ledger,
+                "exchange_balances": {a: {"value": b.value, "locked": b.locked}
+                                      for a, b in view.balances.items() if a in ("TMN", "USDT", "BTC")},
+                "equity_tmn_net": view.equity, "peak_equity_tmn": view.peak, "drawdown_pct": dd,
+                "unknown_facts": list(view.unknown), "intent_source": intent_source}
+
     def _audit_decision(self, d: Decision, forced: TradeIntent | None, verdict: Any, blocked: str | None,
                         view: _View) -> None:
         dd = d.to_dict()
@@ -541,6 +557,9 @@ class AgentRunner:
         self.audit("tool_call", {"decision_id": decision_id, "name": name, "ok": status not in
                                  ("declined", "blocked", "rejected", "stopped", "interrupted"), "status": status,
                                  "order_ids": ids, "reason": reason})
+        link = {"decision_id": decision_id, "order_ids": ids, "status": status, "tool": name}
+        self.store.append("decision_orders", link)        # F1: decision -> orders, for the report
+        self.audit("decision_orders", link)
         # verify: re-read every order and the balances through the engine / exchange. A shortfall
         # blocks new orders at once and, confirmed on a later check, STOPS the bot (engine).
         poll = eng.poll_and_manage(check_balances=False)
@@ -701,6 +720,7 @@ class AgentRunner:
         self.reason = (f"competition deadline reached (final_policy={policy}); holdings: "
                        + ", ".join(f"{plain(v)} {a}" for a, v in sorted(held.items())))
         if self.sm.state is not BotState.STOPPED:
+            self.store.kv_set("exec.stop", {"reason": self.reason, "ts": view.now, "deadline": True})
             self.sm.transition(BotState.STOPPED, f"competition deadline reached; final_policy={policy}")
         return "deadline"
 
@@ -732,36 +752,58 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             pass
 
-    def _end_books(self) -> tuple[dict[str, OrderBook], dict[str, Any] | None]:
+    def _end_books(self) -> tuple[dict[str, OrderBook], dict[str, Any] | None, list[str]]:
         books: dict[str, OrderBook] = {}
         fees = None
+        stale: list[str] = []
         for s in (self.cfg.btc_symbol, self.cfg.usdt_symbol):
             try:
                 books[s] = self.rt.exchange.get_order_book(s)
             except Exception:  # noqa: BLE001
                 if self._last_view is not None and s in self._last_view.books:
                     books[s] = self._last_view.books[s]
+                    stale.append(f"book:{s}")
         try:
             fees = dict(self.rt.exchange.get_fees())
         except Exception:  # noqa: BLE001
             fees = None if self._last_view is None else self._last_view.fees
-        return books, fees
+            stale.append("fees")
+        return books, fees, stale
+
+    def _final_exchange_check(self, stale: list[str]) -> dict[str, Any]:
+        """Live only: is the final ledger confirmed by the exchange balances right now? (F3: the
+        summary must not present a ledger valuation as fact when the exchange cannot confirm it.)"""
+        from .execution import drift_text
+        out: dict[str, Any] = {"at": float(self.clock.now()), "stale_inputs": stale}
+        try:
+            rr = self.rt.portfolio.reconcile(self.rt.exchange.get_balances(), self.engine.tolerance)
+        except Exception as exc:  # noqa: BLE001
+            out.update(verified=None, detail=f"exchange balances unavailable ({type(exc).__name__})")
+            return out
+        out.update(verified=bool(rr.ok and not stale),
+                   detail=(drift_text(rr) if not rr.ok else "") + (
+                       f"; valued with last observed {', '.join(stale)} (exchange unavailable)" if stale else ""))
+        return out
 
     def write_report(self, status: str, *, final: bool) -> tuple[Path, Path, dict[str, Any]]:
+        from .clock import SimClock
         now = float(self.clock.now())
-        books, fees = self._end_books()
+        books, fees, stale = self._end_books()
         started = self.start_ts if self.start_ts is not None else self.store.kv_get(K_START)
         if started is None:
             started = next((ev.ts for ev in self.store.iter_events()), now)
         caveats = list(self.rt.caveats)
         if status == "interrupted":
             caveats.append("PARTIAL report: the run was interrupted and is resumable.")
+        live = getattr(self.rt.mode, "value", self.rt.mode) == "live"
         rep = build_final_report(config=self.cfg, mode=self.rt.mode, run_id=self.rt.run_id,
                                  started_ts=float(started), ended_ts=now, portfolio=self.rt.portfolio,
                                  engine_status=self.engine.status(), store=self.store,
                                  memory_snapshot=self.brain.memory_snapshot(), books_at_end=books, fees=fees,
                                  caveats=caveats, stop_reason=f"{status}: {self.reason}",
-                                 synthetic_data=self.rt.synthetic)
+                                 synthetic_data=self.rt.synthetic,
+                                 clock_kind="simulated" if isinstance(self.clock, SimClock) else "real",
+                                 exchange_check=self._final_exchange_check(stale) if live else None)
         rep["run"] = {"status": status, "final": final, "cycles_this_process": self.cycle,
                       "competition_start": None if self.start_ts is None else rep.get("started_at"),
                       "deadline_ts": self.deadline_ts, "run_dir": str(self.rt.run_dir),

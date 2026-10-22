@@ -90,6 +90,41 @@ def test_start_reconciles_first_and_competition_start_survives_restart(tmp_path)
     assert rt2.store.kv_get(K_START) == first and r2.deadline_ts == first + 24 * 3600
 
 
+SPEC_FIELDS = ("action", "rationale", "confidence", "estimated_net_edge", "alternatives", "state_features",
+               "chosen_tool", "tool_calls", "order_ids", "fills", "fee_assets", "balances", "equity", "drawdown",
+               "hypothesis", "result", "outcome", "reflection", "timestamp", "strategy_version", "strategy",
+               "risk_verdict")
+
+
+def test_final_report_lists_every_executed_decision_with_the_spec_fields(tmp_path):
+    """F1: per executed decision: action, rationale, confidence, edge, alternatives, state features,
+    tool choice, order ids, fills, fee asset, balances, equity, drawdown, hypothesis/result, timestamp,
+    strategy version - and the orders are really linked (no more `order_ids: []`)."""
+    w = sim_world(tmp_path, min_trade_interval_s=60.0)
+    rt = w.runtime(trader_script(buy_every=3, hold_cycles=2))
+    _, res = run(rt, max_cycles=9)
+    rep = json.loads(res.report_path.read_text(encoding="utf-8"))
+    entries = rep["round_trips"]["decisions"]
+    actions = {e["action"] for e in entries}
+    assert {"CONVERT_TMN_USDT", "BUY_BTC", "SELL_BTC"} <= actions
+    executed = [e for e in entries if e["order_ids"]]
+    assert len(executed) >= 3
+    for e in executed:
+        missing = [k for k in SPEC_FIELDS if k not in e]
+        assert not missing, (e["decision_id"], missing)
+        assert e["fills"] and e["fee_assets"] and e["strategy"] == "scripted" and e["strategy_version"]
+        assert e["balances"]["ledger"] and e["balances"]["exchange"] and e["equity"]["peak_tmn"]
+        assert e["risk_verdict"]["approved"] is True and e["timestamp"]
+        assert all(f["client_id"] in e["order_ids"] for f in e["fills"])
+    every_order = {o["client_id"] for o in rep["orders"]["list"]}
+    assert every_order == {c for e in executed for c in e["order_ids"]}       # each order linked
+    assert rep["orders_without_decision"] == []
+    assert all(o["decision_id"] for o in rep["orders"]["list"])                # conversion included
+    holds = rep["hold_decisions"]
+    assert holds["count"] == rep["decisions_by_action"].get("HOLD", 0) and holds["sample"]
+    assert rep["clock"] == "simulated" and "simulated_clock" in rep["labels"]
+
+
 # --------------------------------------------------------------------------- failures
 def test_cycle_exceptions_are_audited_counted_and_stop_after_n(tmp_path, monkeypatch):
     w = sim_world(tmp_path, min_trade_interval_s=30.0, order_timeout_s=10_000)

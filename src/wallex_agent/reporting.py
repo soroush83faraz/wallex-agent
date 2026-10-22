@@ -370,15 +370,127 @@ def _equity_summary(curve: list[tuple[float, Decimal]], initial: Decimal, final_
     }
 
 
+def _base_decision_id(did: Any) -> str | None:
+    """Orders of a forced exit carry ``<decision_id>:forced``: they belong to that decision."""
+    return None if did is None else str(did).split(":", 1)[0]
+
+
+def _compact_tools(calls: Any) -> list[dict[str, Any]]:
+    out = []
+    for tc in calls or []:
+        if isinstance(tc, Mapping):
+            out.append({"tool": tc.get("tool") or tc.get("name"), "called": tc.get("called"),
+                        "ok": tc.get("ok"), "why": str(tc.get("why") or "")[:160]})
+    return out
+
+
+def _decision_section(store: Any, order_rows: Mapping[str, dict[str, Any]],
+                      fills_by_order: Mapping[str, list[dict[str, Any]]],
+                      outcomes: Mapping[str, list[dict[str, Any]]],
+                      reflections: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Every NON-HOLD decision (and any decision that led to orders) in full, with the spec fields;
+    HOLDs as counts plus a compact sample (first, last, every state change)."""
+    linked: dict[str, list[str]] = {}
+    for cid, row in order_rows.items():
+        base = _base_decision_id(row.get("decision_id"))
+        if base:
+            linked.setdefault(base, []).append(cid)
+    for ev in store.iter_events("decision_orders"):
+        base = _base_decision_id(ev.payload.get("decision_id"))
+        for cid in ev.payload.get("order_ids") or []:
+            if base and cid not in linked.setdefault(base, []):
+                linked[base].append(cid)
+    actions: Counter[str] = Counter()
+    tool_counts: Counter[str] = Counter()
+    entries: list[dict[str, Any]] = []
+    hold_strategies: Counter[str] = Counter()
+    hold_sample: list[dict[str, Any]] = []
+    holds = scored = 0
+    last_hold: dict[str, Any] | None = None
+    prev_state: Any = None
+    seen: set[str] = set()
+    for ev in store.iter_events("decision"):
+        raw = ev.payload
+        p = raw["decision"] if isinstance(raw.get("decision"), Mapping) else raw   # AgentMemory wraps it
+        ctx = raw.get("context") if isinstance(raw.get("context"), Mapping) else {}
+        action = str(p.get("action", "UNKNOWN"))
+        actions[action] += 1
+        for tc in p.get("tool_calls") or []:
+            if isinstance(tc, Mapping):
+                tool_counts[str(tc.get("name") or tc.get("tool") or "?")] += 1
+        did = _decision_id(p)
+        if did:
+            seen.add(did)
+        hyp = p.get("hypothesis") if isinstance(p.get("hypothesis"), Mapping) else {}
+        strategy = hyp.get("strategy") or hyp.get("name")
+        state = (p.get("state_features") or {}).get("state") if isinstance(p.get("state_features"), Mapping) \
+            else None
+        state = state or ctx.get("state")
+        ts = _iso(float(p["ts"])) if isinstance(p.get("ts"), (int, float)) else _iso(ev.ts)
+        ids = sorted(linked.get(did or "", []), key=lambda c: (order_rows[c].get("created_at") or "", c)
+                     if c in order_rows else ("", c))
+        if action == "HOLD" and not ids:
+            holds += 1
+            scored += 1 if did in reflections else 0
+            hold_strategies[str(strategy or "?")] += 1
+            compact = {"decision_id": did, "timestamp": ts, "state": state, "strategy": strategy,
+                       "confidence": p.get("confidence"), "chosen_tool": p.get("chosen_tool"),
+                       "rationale": str(p.get("rationale", ""))[:200]}
+            if not hold_sample or state != prev_state:
+                hold_sample.append(compact)
+            last_hold = compact
+            prev_state = state
+            continue
+        prev_state = state
+        fills = [f for c in ids for f in fills_by_order.get(c, [])]
+        outs = outcomes.get(did or "", [])
+        refl = reflections.get(did or "", [])
+        entries.append({
+            "decision_id": did, "timestamp": ts, "at": ts, "cycle": p.get("cycle"),
+            "strategy_version": p.get("strategy_version"), "action": action, "strategy": strategy,
+            "rationale": str(p.get("rationale", ""))[:500], "confidence": p.get("confidence"),
+            "estimated_net_edge": p.get("estimated_net_edge"), "hypothesis": hyp,
+            "alternatives": list(p.get("alternatives") or []),
+            "state_features": dict(p.get("state_features") or {}),
+            "chosen_tool": p.get("chosen_tool"), "tool_calls": _compact_tools(p.get("tool_calls")),
+            "observed_prices": dict(p.get("observed_prices") or {}), "intent": p.get("intent"),
+            "risk_verdict": p.get("risk_verdict"),
+            "order_ids": ids, "orders": [order_rows[c] for c in ids if c in order_rows], "fills": fills,
+            "fee_assets": sorted({str(f["fee_asset"]) for f in fills}),
+            "balances": {"ledger": ctx.get("ledger"), "exchange": ctx.get("exchange_balances"),
+                         "note": "at decision time"} if ctx else None,
+            "equity": {"equity_tmn_net": ctx.get("equity_tmn_net"), "peak_tmn": ctx.get("peak_equity_tmn"),
+                       "note": "at decision time, net of exit costs"} if ctx else None,
+            "drawdown": {"pct": ctx.get("drawdown_pct"), "note": "at decision time"} if ctx else None,
+            "outcome": outs[-1] if outs else None, "reflection": refl[-1] if refl else None,
+            "result": {"order": next((o.get("result") for o in reversed(outs) if o.get("kind") == "order"), None),
+                       "round_trip": next((o.get("result") for o in reversed(outs) if o.get("kind") == "round_trip"),
+                                          None),
+                       "reflection": (refl[-1].get("result") or refl[-1].get("lesson")) if refl else None},
+        })
+    if last_hold is not None and (not hold_sample or hold_sample[-1] is not last_hold):
+        hold_sample.append(last_hold)
+    orphans = [{"client_id": c, "decision_id": r.get("decision_id"), "purpose": r.get("purpose")}
+               for c, r in order_rows.items() if _base_decision_id(r.get("decision_id")) not in seen]
+    return {"entries": entries, "actions": actions, "tool_counts": tool_counts, "holds": holds,
+            "scored": scored, "hold_strategies": hold_strategies, "hold_sample": hold_sample[:200],
+            "orphans": orphans}
+
+
 def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts: float,
                        ended_ts: float, portfolio: Any, engine_status: Mapping[str, Any] | None,
                        store: Any, memory_snapshot: Any, books_at_end: Mapping[str, OrderBook] | None,
                        fees: Mapping[str, Any] | None, caveats: Sequence[str] | None,
-                       stop_reason: str | None, synthetic_data: bool = False) -> dict[str, Any]:
+                       stop_reason: str | None, synthetic_data: bool = False,
+                       clock_kind: str | None = None,
+                       exchange_check: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Assemble ``final_report.json`` content from persisted facts (store, ledger, books).
-    Values are net of exit costs; nothing is rounded in the agent's favour."""
+    Values are net of exit costs; nothing is rounded in the agent's favour. ``clock_kind``:
+    'simulated' (SimClock: backtest/demo) or 'real' (default: by mode). ``exchange_check``: whether
+    the final ledger was verified against exchange balances (live)."""
     scrub = Scrubber([config.api_key] if getattr(config, "api_key", "") else [])
     mode_v = Mode(mode).value
+    clock_kind = clock_kind or ("simulated" if mode_v == Mode.BACKTEST.value else "real")
     books = dict(books_at_end or {})
     initial = portfolio.initial_tmn
 
@@ -431,7 +543,7 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
         slot[f.fee_asset] = slot.get(f.fee_asset, Decimal(0)) + f.fee
     source_counts = Counter(f.fee_source for f in fills)
 
-    # ---- decisions: hypothesis vs result
+    # ---- decisions: hypothesis vs result, with the orders/fills each one led to
     outcomes: dict[str, list[dict[str, Any]]] = {}
     reflections: dict[str, list[dict[str, Any]]] = {}
     for kind, sink in (("outcome", outcomes), ("reflection", reflections)):
@@ -439,35 +551,16 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
             did = _decision_id(ev.payload)
             if did is not None:
                 sink.setdefault(did, []).append(dict(ev.payload))
-    actions: Counter[str] = Counter()
-    tool_counts_decisions: Counter[str] = Counter()
-    trade_decisions: list[dict[str, Any]] = []
-    scored_holds = 0
-    for ev in store.iter_events("decision"):
-        p = ev.payload
-        if isinstance(p.get("decision"), Mapping):   # AgentMemory wraps it: {"decision": {...}, "points": ...}
-            p = p["decision"]
-        action = str(p.get("action", "UNKNOWN"))
-        actions[action] += 1
-        for tc in p.get("tool_calls") or []:
-            if isinstance(tc, Mapping):
-                tool_counts_decisions[str(tc.get("name") or tc.get("tool") or "?")] += 1
-        did = _decision_id(p)
-        if action == "HOLD":
-            scored_holds += 1 if did in reflections else 0
-            continue
-        hyp = p.get("hypothesis") if isinstance(p.get("hypothesis"), Mapping) else {}
-        trade_decisions.append({
-            "decision_id": did, "at": _iso(ev.ts), "action": action,
-            "strategy": hyp.get("name"), "hypothesis": hyp, "confidence": p.get("confidence"),
-            "estimated_net_edge": p.get("estimated_net_edge"),
-            "rationale": str(p.get("rationale", ""))[:300], "order_ids": p.get("order_ids") or [],
-            "outcome": (outcomes.get(did) or [None])[-1], "reflection": (reflections.get(did) or [None])[-1],
-        })
+    fills_by_order: dict[str, list[dict[str, Any]]] = {}
+    for row in fill_rows:
+        fills_by_order.setdefault(str(row["client_id"]), []).append(row)
+    sec = _decision_section(store, {str(r["client_id"]): r for r in order_rows}, fills_by_order,
+                            outcomes, reflections)
+    actions, trade_decisions, scored_holds = sec["actions"], sec["entries"], sec["scored"]
     tool_events = Counter(str(ev.payload.get("name") or ev.payload.get("tool") or "?")
                           for ev in store.iter_events("tool_call"))
     tool_usage = ({"source": "tool_call events", "counts": dict(tool_events)} if tool_events else
-                  {"source": "decision.tool_calls", "counts": dict(tool_counts_decisions)})
+                  {"source": "decision.tool_calls", "counts": dict(sec["tool_counts"])})
     max_listed = 500
     pos = portfolio.btc_position()
     holdings = portfolio.expected_balances()
@@ -485,6 +578,11 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
         labels.append("estimated_fee_fills")
     if final_net is None:
         labels.append("valuation_incomplete")
+    if clock_kind == "simulated":
+        labels.append("simulated_clock")
+    verified = (exchange_check or {}).get("verified")
+    if mode_v == Mode.LIVE.value and verified is not True:
+        labels.append("valuation_unverified")
 
     def fee_text(src: str) -> str:
         assets = fee_by_source.get(src, {})
@@ -510,6 +608,14 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
     ]
     if synthetic_data:
         honest.append("Market data was SYNTHETIC (generated), not real Wallex history.")
+    if clock_kind == "simulated":
+        honest.append("All timestamps in this report are SIMULATED market time (the replay/synthetic clock), "
+                      "not wall-clock time.")
+    if mode_v == Mode.LIVE.value and verified is not True:
+        honest.append("The final value is the LEDGER (recorded fills) valued at the final books; it was NOT "
+                      "verified against the exchange balances at the end"
+                      + (f" ({(exchange_check or {}).get('detail')})" if (exchange_check or {}).get("detail") else "")
+                      + ". Check the account in the Wallex app.")
     if flags:
         honest.append(f"Valuation flags: {', '.join(flags)}.")
     honest += [str(c) for c in (caveats or [])]
@@ -532,10 +638,16 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
         "labels": labels,
         "started_at": _iso(started_ts),
         "ended_at": _iso(ended_ts),
+        "clock": clock_kind,
+        "clock_note": ("timestamps are SIMULATED market time (SimClock), not wall-clock time"
+                       if clock_kind == "simulated" else "timestamps are wall-clock UTC"),
         "duration_h": round((float(ended_ts) - float(started_ts)) / 3600, 4),
         "stop_reason": stop_reason,
         "config": config.redacted(),
         "value": {
+            "basis": "ledger (recorded fills only) valued at the final books net of exit costs",
+            "verified_against_exchange": verified if mode_v == Mode.LIVE.value else None,
+            "exchange_check": dict(exchange_check) if exchange_check else None,
             "initial_tmn": initial,
             "final_tmn_net_of_exit_costs": _q(final_net, "0.01"),
             "final_tmn_at_mid": _q(final_mid, "0.01"),
@@ -574,6 +686,11 @@ def build_final_report(*, config: Any, mode: Mode | str, run_id: str, started_ts
                         "decisions_truncated": max(0, len(trade_decisions) - max_listed)},
         "decisions_by_action": dict(actions),
         "hold_decisions_scored": scored_holds,
+        "hold_decisions": {"count": sec["holds"], "scored": scored_holds,
+                           "by_strategy": dict(sec["hold_strategies"]),
+                           "sample": sec["hold_sample"],
+                           "sample_rule": "first and last HOLD, plus every HOLD where the bot state changed"},
+        "orders_without_decision": sec["orphans"],
         "tool_usage": tool_usage,
         "memory": memory_snapshot,
         "end": {"holdings": holdings, "final_policy": policy, "final_policy_applied": policy_note,

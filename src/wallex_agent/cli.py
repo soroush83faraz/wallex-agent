@@ -172,13 +172,17 @@ def _fmt_tmn(v: Any) -> str:
 def print_summary(res: RunResult, rt: Any, title: str) -> None:
     rep = res.report or {}
     labels = rep.get("labels") or []
+    live = rt.mode is Mode.LIVE
     out(f"== {title} ==")
     if "synthetic_data" in labels:
-        out("   SYNTHETIC DATA (seeded random model, not market data); fills SIMULATED; fee ASSUMED")
-    elif rt.mode is not Mode.LIVE:
+        out("   SYNTHETIC DATA (seeded random model, not market data); fills SIMULATED; fee ASSUMED; "
+            "timestamps are SIMULATED time")
+    elif not live:
         out(f"   SIMULATED orders/fills ({rt.mode.value}); fee ASSUMED at {rt.config.paper_fee_rate}")
     out(f"run:        {rt.run_id}")
     out(f"status:     {res.status} (exit {res.exit_code}) - {res.reason}")
+    val = rep.get("value") or {}
+    unverified = live and val.get("verified_against_exchange") is not True
     if rep:
         out(f"period:     {rep.get('started_at')} -> {rep.get('ended_at')} ({rep.get('duration_h')} h)")
         acts = rep.get("decisions_by_action") or {}
@@ -188,22 +192,30 @@ def print_summary(res: RunResult, rt: Any, title: str) -> None:
         out(f"orders:     {orders.get('count', 0)} {orders.get('by_lifecycle', {})}; fills "
             f"{(rep.get('fills') or {}).get('count', 0)}; round trips {rt_.get('count', 0)} "
             f"(wins {rt_.get('wins', 0)}, losses {rt_.get('losses', 0)})")
-        val, pnl = rep.get("value") or {}, rep.get("pnl") or {}
+        pnl = rep.get("pnl") or {}
         out(f"value:      {_fmt_tmn(val.get('initial_tmn'))} TMN -> {_fmt_tmn(val.get('final_tmn_net_of_exit_costs'))} "
-            f"TMN net of exit costs (P&L {pnl.get('abs_tmn')} TMN, {pnl.get('pct')} %)")
-        out(f"target:     {pnl.get('target_statement')}")
+            f"TMN net of exit costs (P&L {pnl.get('abs_tmn')} TMN, {pnl.get('pct')} %)"
+            + ("  [LEDGER-BASED, NOT verified against the exchange balances: "
+               f"{(val.get('exchange_check') or {}).get('detail') or 'no confirmation'}]" if unverified else ""))
+        out(f"target:     {pnl.get('target_statement')}" + (" (unverified)" if unverified else ""))
         fees = rep.get("fees_paid") or {}
         out("fees paid:  " + (", ".join(f"{v} {k}" for k, v in sorted(fees.items())) or "none"))
         holdings = ((rep.get("end") or {}).get("holdings") or {})
-        out("holdings:   " + (", ".join(f"{v} {k}" for k, v in sorted(holdings.items()) if v not in ("0", 0))
-                              or "none"))
+        out(("holdings:   " if not live else "ledger:     ")
+            + (", ".join(f"{v} {k}" for k, v in sorted(holdings.items()) if v not in ("0", 0)) or "none"))
     if res.report_path:
         out(f"report:     {res.report_path}")
     if res.trace_path:
         out(f"trace:      {res.trace_path}")
     ok, bad = verify_chain(rt.audit.path)
     out(f"audit:      {rt.audit.path} (hash chain {'OK' if ok else f'BROKEN at line {bad}'})")
-    out("Past (simulated) results do not predict future results; 2x is not guaranteed.")
+    if live:
+        out("REAL-MONEY run: the numbers above are the bot's own fills ledger valued at the last books"
+            + (", NOT confirmed by the exchange at the end: check the account in the Wallex app"
+               if unverified else ", confirmed against the exchange balances at the end")
+            + ". They say nothing about future results; 2x is not guaranteed.")
+    else:
+        out("Past (simulated) results do not predict future results; 2x is not guaranteed.")
 
 
 def _run(rt: Any, runner: AgentRunner, title: str, **run_kw: Any) -> int:
@@ -611,7 +623,8 @@ def cmd_report(ctx: Ctx) -> int:
         events = list(snap.iter_events())
         end_ts = events[-1].ts if events else time.time()
         caveats = [f"Rebuilt offline from the store; valued at the last books observed by the agent "
-                   f"({_iso(books_ts) or 'none recorded'})."]
+                   f"({_iso(books_ts) or 'none recorded'}). The runner's own final_report.json (if any) is "
+                   "left untouched; this file is final_report.rebuilt.json."]
         if mode is not Mode.LIVE:
             caveats.append(f"Fees ASSUMED at {cfg.paper_fee_rate} ({mode.value}).")
         state = (snap.kv_get("bot_state") or {}).get("state")
@@ -620,11 +633,15 @@ def cmd_report(ctx: Ctx) -> int:
                                  ended_ts=float(end_ts), portfolio=pf, engine_status={"state": state},
                                  store=snap, memory_snapshot=AgentMemory(snap).snapshot(), books_at_end=books,
                                  fees=fees, caveats=caveats, stop_reason=f"rebuilt by `report` (state {state})",
-                                 synthetic_data=bool((snap.kv_get(K_LABELS) or {}).get("synthetic")))
+                                 synthetic_data=bool((snap.kv_get(K_LABELS) or {}).get("synthetic")),
+                                 exchange_check={"verified": None, "detail": "offline rebuild: no exchange "
+                                                 "balances were read"} if mode is Mode.LIVE else None)
     finally:
         snap.close()
     rdir.mkdir(parents=True, exist_ok=True)
-    path = write_final_report(rdir / "final_report.json", rep, secrets=[cfg.api_key] if cfg.api_key else [])
+    # never overwrite the runner's final_report.json (F3): the rebuild is a separate file
+    path = write_final_report(rdir / "final_report.rebuilt.json", rep,
+                              secrets=[cfg.api_key] if cfg.api_key else [])
     out(_json({k: rep.get(k) for k in ("run_id", "mode", "labels", "started_at", "ended_at", "stop_reason")}
               | {"value": rep["value"].get("final_tmn_net_of_exit_costs"), "pnl": rep["pnl"],
                  "orders": rep["orders"]["count"], "fills": rep["fills"]["count"]}))
@@ -764,7 +781,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignored (kept for old scripts): --cancel-open acts on the live store whenever it exists")
     s.set_defaults(func=cmd_kill)
 
-    s = add("report", "rebuild final_report.json from the store (offline)")
+    s = add("report", "rebuild the report from the store (offline) into final_report.rebuilt.json",
+            "Rebuilds the final report offline from the run's store and writes final_report.rebuilt.json next "
+            "to the runner's own final_report.json, which is never overwritten. Live values in a rebuild are "
+            "ledger-based and NOT verified against the exchange.")
     s.add_argument("--mode", choices=[m.value for m in Mode], help="default: TRADING_MODE (paper)")
     s.add_argument("--run", help="run id (default: the mode's last run)")
     s.set_defaults(func=cmd_report)
