@@ -145,8 +145,10 @@ def sim_world(tmp_path: Path, *, step_s: float = 60.0, balances: dict[str, D] | 
 
 
 def live_like_runtime(tmp_path: Path, *, sim_kw: dict | None = None, balances: dict[str, D] | None = None,
-                      **cfg_kw: Any) -> tuple[Any, SimExchange, SimClock]:
-    """A LIVE-mode Runtime wired to a SimExchange (canary tests): the canary file goes to tmp_path."""
+                      preflight: bool = True, **cfg_kw: Any) -> tuple[Any, SimExchange, SimClock]:
+    """A LIVE-mode Runtime wired to a SimExchange (canary tests): the canary file goes to tmp_path. With
+    ``preflight`` (default) it does what ``cli canary`` does before ``run_canary``: ``reconcile_startup``
+    then the engine's connectivity preflight (both must pass)."""
     import random
     clock = SimClock(T0)
     cfg = replace(Config(data_dir=str(tmp_path), mode=Mode.LIVE), **cfg_kw)
@@ -158,7 +160,11 @@ def live_like_runtime(tmp_path: Path, *, sim_kw: dict | None = None, balances: d
     store = SqliteStore(tmp_path / "live" / "state.db", clock=clock)
     rt = assemble(cfg, Mode.LIVE, run_id="live-test", run_dir=tmp_path / "live" / "runs" / "live-test", store=store,
                   clock=clock, exchange=sim, book_source=source, labels=["test"])
-    return track(rt), sim, clock
+    track(rt)
+    if preflight:
+        assert rt.engine.reconcile_startup()["ok"]
+        assert rt.engine.preflight()["ok"]
+    return rt, sim, clock
 
 
 def ledger_matches(rt: Any, sim: SimExchange, assets=("BTC", "USDT", "TMN")) -> bool:

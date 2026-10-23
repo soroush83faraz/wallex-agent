@@ -160,6 +160,40 @@ def test_cancel_only_runtime_needs_a_key(tmp_path):
         build_cancel_only_runtime(Config(data_dir=str(tmp_path)))
 
 
+def test_read_only_client_refuses_post_and_delete_before_io_and_never_shows_the_key(tmp_path, capsys, caplog):
+    """`check-live` and `net-check` use read_only_client: POST/DELETE raise ForbiddenEndpointError before
+    any I/O, and the key is absent from every exception, repr, log line and captured output."""
+    import logging
+    from wallex_agent.modes.live import read_only_client
+    caplog.set_level(logging.DEBUG)
+    tr = RecordingTransport(responder=lambda *a: (200, {}, b"{}"))
+    ro = read_only_client(live_cfg(tmp_path), transport=tr, max_read_retries=0)
+    assert ro.read_only and ro.has_key
+    texts = [repr(ro), str(ro), repr(vars(ro))]
+    for client in (ro, ro.as_read_only()):
+        for call in (lambda: client.create_order(OrderRequest("wa-1", "USDTTMN", Side.BUY, D("1"), D("1"))),
+                     lambda: client.cancel_order("wa-1")):
+            with pytest.raises(ForbiddenEndpointError) as ei:
+                call()
+            texts += [str(ei.value), repr(ei.value)]
+    assert len(tr.records) == 0                                  # refused before any I/O
+    out = capsys.readouterr()
+    for text in texts + [out.out, out.err, caplog.text]:
+        assert SENTINEL not in text
+
+
+def test_only_live_engines_require_the_order_preflight(tmp_path):
+    arm(tmp_path)
+    tr = RecordingTransport(responder=lambda *a: (500, {}, b""))
+    live = track(build_live(live_cfg(tmp_path), flag_ack=True, typed_phrase=PHRASE, transport=tr,
+                            clock=SimClock(NOW), now=NOW))
+    assert live.engine.require_preflight and not live.engine.preflight_ok
+    paper = track(build_runtime(Config(data_dir=str(tmp_path / "p")), "paper", transport=recording_public_transport(),
+                                clock=SimClock()))
+    back = track(build_runtime(Config(data_dir=str(tmp_path / "b")), "backtest", synthetic=True, seed=1, hours=0.2))
+    assert not paper.engine.require_preflight and not back.engine.require_preflight
+
+
 # --------------------------------------------------------------------------- live gate in the builder
 def ok_runner(argv, cwd):
     return 0, f"{lg.MIN_SELFTEST_TESTS + 100} passed in 0.5s\n"

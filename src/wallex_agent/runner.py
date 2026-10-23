@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .agent import Observation
-from .errors import KillSwitchActive
+from .errors import KillSwitchActive, error_label
 from .market_data import StaleQuote, ensure_fresh
 from .reporting import Scrubber, build_final_report, render_trace, write_final_report
 from .risk import RiskContext
@@ -192,7 +192,10 @@ class AgentRunner:
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> str | None:
-        """Restart reconciliation first. Returns None if trading may proceed, else a terminal status."""
+        """Restart reconciliation first, then (live: ``engine.require_preflight``) the connectivity
+        preflight (rules for both symbols, both books fresh and non-crossed). Returns None if trading may
+        proceed, else a terminal status (a failed preflight is ``unavailable``: exit 7, nothing sent, the
+        competition clock is not started)."""
         try:
             if self.engine.kill_requested():
                 self.reason = "KILL switch present at start"
@@ -213,6 +216,15 @@ class AgentRunner:
             if not rep.get("ok"):
                 self.reason = f"startup reconciliation incomplete: {'; '.join(map(str, rep.get('actions') or []))}"
                 return "unavailable"
+            if getattr(self.engine, "require_preflight", False):
+                # live: no order of this process before rules (both symbols), both books (fresh,
+                # non-crossed) and the reconcile above are confirmed (the engine enforces it too)
+                pf = self.engine.preflight()
+                if not pf.get("ok"):
+                    self.reason = ("connectivity/reconcile preflight failed, no order was sent: "
+                                   + "; ".join(map(str, pf.get("problems") or [])))
+                    self.audit("alert", {"alert": "preflight_failed", "level": "error", "reason": self.reason[:500]})
+                    return "unavailable"
             self.store.kv_set(K_LABELS, {"synthetic": bool(self.rt.synthetic), "labels": list(self.rt.labels)})
             start = self.store.kv_get(K_START)
             if start is None:
@@ -424,18 +436,18 @@ class AgentRunner:
             unknown += [f"rules:{s}" for s in syms if s not in rules]
         except Exception as exc:  # noqa: BLE001
             unknown.append("rules")
-            errors["rules"] = type(exc).__name__
+            errors["rules"] = error_label(exc)
         try:
             fees = dict(ex.get_fees())
             unknown += [f"fee:{s}" for s in syms if s not in fees]
         except Exception as exc:  # noqa: BLE001
             unknown.append("fees")
-            errors["fees"] = type(exc).__name__
+            errors["fees"] = error_label(exc)
         try:
             balances = dict(ex.get_balances())
         except Exception as exc:  # noqa: BLE001
             unknown.append("balances")
-            errors["balances"] = type(exc).__name__
+            errors["balances"] = error_label(exc)
         for s in syms:
             try:
                 b = ex.get_order_book(s)
@@ -447,7 +459,7 @@ class AgentRunner:
                 errors[f"book:{s}"] = str(exc)[:120]
             except Exception as exc:  # noqa: BLE001
                 unknown.append(f"book:{s}")
-                errors[f"book:{s}"] = type(exc).__name__
+                errors[f"book:{s}"] = error_label(exc)
         now = float(self.clock.now())   # re-read AFTER the (possibly slow) fetches
         ledger = self.rt.portfolio.expected_balances()
         position = self.rt.portfolio.btc_position()

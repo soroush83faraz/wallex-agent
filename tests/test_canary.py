@@ -193,6 +193,47 @@ def test_cli_canary_routes_signals_to_the_canary(monkeypatch, tmp_path, capsys):
     assert SENTINEL not in capsys.readouterr().err
 
 
+def test_canary_refuses_without_the_connectivity_preflight(tmp_path):
+    """Requirement: no order before rules (both symbols), both books (fresh, non-crossed) and the startup
+    reconcile passed in this process - run_canary checks it itself (the engine checks it again)."""
+    rt, sim, _ = live_like_runtime(tmp_path, preflight=False)
+    with pytest.raises(CanaryRefused, match="preflight has not passed"):
+        run_canary(rt)
+    assert sum(sim.post_counts.values()) == 0 and rt.store.list_orders() == []
+
+
+@pytest.mark.parametrize("fault", ["crossed_usdttmn_book", "markets_down_after_reconcile"])
+def test_cli_canary_refuses_when_the_preflight_fails_and_sends_nothing(monkeypatch, tmp_path, capsys, fault):
+    from wallex_agent import cli
+    from wallex_agent.errors import TransportError
+    from wallex_agent.modes import live as live_mode
+    from wallex_agent.runner import EXIT_UNAVAILABLE
+    from wallex_agent.types import BookLevel, OrderBook
+    rt, sim, clock = live_like_runtime(tmp_path, preflight=False)
+    if fault == "crossed_usdttmn_book":
+        real_book = sim.get_order_book
+        crossed = OrderBook(USD, (BookLevel(D("272100"), D("5")),), (BookLevel(D("272000"), D("5")),), clock.now())
+        sim.get_order_book = lambda s: crossed if s == USD else real_book(s)
+    else:
+        real, calls = sim.get_markets, {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise TransportError("[read_timeout] x | hint: y", category="read_timeout")
+            return real()
+        sim.get_markets = flaky
+    monkeypatch.setattr(live_mode, "build_canary_runtime", lambda *a, **k: rt)
+    code = cli.main(["--env-file", str(tmp_path / "none.env"), "canary", "--i-understand-real-money"],
+                    env={"DATA_DIR": str(tmp_path), "WALLEX_API_KEY": SENTINEL})
+    err = capsys.readouterr().err
+    assert code == EXIT_UNAVAILABLE and "canary refused (nothing sent): connectivity/reconcile preflight failed" in err
+    assert ("book_crossed: USDTTMN" if fault == "crossed_usdttmn_book"
+            else "rules_unavailable: TransportError[read_timeout]") in err
+    assert "net-check" in err and SENTINEL not in err
+    assert sum(sim.post_counts.values()) == 0 and not (tmp_path / lg.CANARY_FILE).exists()
+
+
 def test_id_pattern_hides_values():
     assert id_pattern("LIMIT-0123456789abcdef") == "LIMIT-<hex16>"
     assert id_pattern("12345678") == "<hex8>"

@@ -5,7 +5,11 @@ Safety properties (each unit-tested in tests/test_wallex_client.py):
 * Every request is checked against an explicit ``(method, path)`` allow-list BEFORE any I/O, and
   withdrawal / transfer / deposit / profile / bank / OTC paths are additionally deny-listed.
 * The API key travels only in ``X-API-Key``, only on private routes, only to ``api.wallex.ir`` over
-  verified TLS; it is scrubbed from every exception message, stored body and log line.
+  verified TLS; it is scrubbed from every exception message, stored body and log line. A proxy
+  (``WALLEX_PROXY_URL`` / opted-in environment proxy) only changes the ROUTE: a CONNECT tunnel to
+  ``api.wallex.ir:443``, with TLS end-to-end and verified against ``api.wallex.ir`` inside it.
+* Every network failure is a ``TransportError`` with a classified, scrubbed diagnosis (``category``,
+  ``hint``; ``exchange/net.py``), raised outside ``except`` blocks (nothing is chained).
 * Writes (POST/DELETE) are sent exactly once - never retried here. ``RejectedError`` is raised only
   for 4xx answers that prove the order was refused; every other non-success outcome of a POST is
   an *unknown outcome* (``TransportError`` / ``ServerError`` / ``SchemaError``).
@@ -23,7 +27,6 @@ import logging
 import math
 import re
 import socket
-import ssl
 import threading
 import time
 import urllib.error
@@ -39,6 +42,9 @@ from ..errors import (AuthError, ConfigError, ForbiddenEndpointError, OrderNotFo
                       RejectedError, SchemaError, ServerError, TransportError)
 from ..types import (Balance, Candle, FeeRates, MarketRules, OrderBook, OrderInfo, OrderRequest,
                      OrderStatus, Side, Trade, plain, quantize_down, validate_symbol)
+from .net import (CATEGORIES, INCOMPLETE_READ, PH_BODY, PROTOCOL_ERROR, PROXY_CONNECT_FAILED, READ_TIMEOUT,
+                  TRANSPORT_OTHER, Diagnosis, ProxySettings, RequestTrace, TracingHTTPSHandler, diagnose,
+                  hint_for, load_proxy_settings, tls_context)
 
 __all__ = [
     "AmbiguousResponseError", "CANDLE_RESOLUTIONS", "DEFAULT_BASE_URL", "DEFAULT_SYMBOLS",
@@ -215,62 +221,158 @@ def _abort_socket(sock: Any, fired: threading.Event) -> None:
         pass
 
 
+def _framed_length(raw_headers: Any, lower: Mapping[str, str], status: int) -> int | None | str:
+    """Declared body length (``Content-Length``) when the body is length-framed; None when it is not
+    (chunked: http.client raises ``IncompleteRead`` itself; no length: the end is the connection
+    close, and the JSON parse decides); ``"conflict"`` for differing duplicate Content-Length values."""
+    if status in (204, 304) or 100 <= status <= 199:
+        return None
+    if "chunked" in lower.get("transfer-encoding", "").lower():
+        return None
+    get_all = getattr(raw_headers, "get_all", None)
+    if callable(get_all):
+        try:
+            values = {str(v).strip() for v in (get_all("Content-Length") or [])}
+        except Exception:  # noqa: BLE001 - unusual header object: fall back to the dict
+            values = set()
+        if len(values) > 1:
+            return "conflict"
+    raw = lower.get("content-length")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw.isdigit() or len(raw) > 15:      # http.client ignores an invalid length the same way
+        return None
+    return int(raw)
+
+
 class UrllibTransport:
-    """Default stdlib transport: verified TLS >= 1.2, no redirects, no environment proxies (unless
-    asked), no retries, response body capped (reads at most ``max_response_bytes + 1`` bytes so
-    the client can detect the overflow), and a TOTAL deadline of ``timeout`` for reading the body:
-    each read is a single ``read1`` with the socket timeout set to the time left, and a watchdog
-    shuts the socket down at the deadline (a peer dripping one byte at a time, also inside chunked
-    framing, cannot hold a request open)."""
+    """Default stdlib transport: verified TLS >= 1.2 (``net.tls_context``: CERT_REQUIRED + hostname
+    check; ``OP_IGNORE_UNEXPECTED_EOF`` with explicit framing checks), no redirects, no retries, and no
+    IMPLICIT proxy: the route is ``proxy_url`` (WALLEX_PROXY_URL), else - only with ``use_env_proxy`` -
+    https_proxy/HTTPS_PROXY then http_proxy/HTTP_PROXY of ``environ`` (default ``os.environ``) honouring
+    NO_PROXY, else direct; the OS proxy settings are never read. Through a proxy the request is a CONNECT
+    tunnel to the URL's host:port, TLS inside it is verified against that host, the proxy credentials go
+    only into the CONNECT, and a request carrying ``X-API-Key`` must target api.wallex.ir:443.
+
+    The response body is capped (reads at most ``max_response_bytes + 1`` bytes so the client can
+    detect the overflow) and read under a TOTAL deadline of ``timeout``: each read is a single ``read1``
+    with the socket timeout set to the time left, and a watchdog shuts the socket down at the deadline
+    (a peer dripping one byte at a time, also inside chunked framing, cannot hold a request open). A
+    length-framed body that ends early is an ``incomplete_read`` failure, never a short success.
+
+    Every failure is a ``TransportError`` with a classified, scrubbed diagnosis (``category``, ``hint``,
+    ``phase``); ``last_trace`` describes the last request (phases, timings, status, bytes)."""
 
     def __init__(self, *, max_response_bytes: int = MAX_RESPONSE_BYTES,
-                 use_env_proxy: bool = False, opener: Any = None) -> None:
-        ctx = ssl.create_default_context()
-        ctx.minimum_version = max(ctx.minimum_version, ssl.TLSVersion.TLSv1_2)
-        if ctx.verify_mode != ssl.CERT_REQUIRED or not ctx.check_hostname:  # pragma: no cover
-            raise ConfigError("TLS certificate and hostname verification must be enabled")
+                 use_env_proxy: bool = False, proxy_url: str | None = None,
+                 environ: Mapping[str, str] | None = None, opener: Any = None) -> None:
+        ctx = tls_context()
         self._ctx = ctx
         self._max = int(max_response_bytes)
+        self._proxies: ProxySettings = load_proxy_settings(
+            proxy_url=proxy_url, use_env_proxy=use_env_proxy, environ=environ)
         if opener is None:   # ``opener`` exists only so tests can run without any network
             opener = urllib.request.build_opener(   # debuglevel pinned: a wire dump shows the key
-                urllib.request.ProxyHandler(None if use_env_proxy else {}),
-                _NoRedirect(), urllib.request.HTTPSHandler(debuglevel=0, context=ctx))
+                urllib.request.ProxyHandler({}),     # never an implicit proxy: the route is set per request
+                _NoRedirect(), TracingHTTPSHandler(debuglevel=0, context=ctx))
             opener.addheaders = []
         self._opener = opener
+        self.last_trace: RequestTrace | None = None
+
+    @property
+    def proxy_settings(self) -> ProxySettings:
+        return self._proxies
+
+    def __repr__(self) -> str:
+        return f"UrllibTransport({self._proxies!r})"
+
+    @staticmethod
+    def _refusal(detail: str) -> TransportError:
+        """A request refused locally, before any I/O (same message shape as a network failure)."""
+        hint = "refused locally before any network I/O: a bug or a wrong base URL, not the network"
+        return TransportError(f"[{TRANSPORT_OTHER}] {detail} | hint: {hint}", category=TRANSPORT_OTHER, hint=hint)
 
     def request(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None,
                 timeout: float) -> tuple[int, Mapping[str, str], bytes]:
         if not isinstance(url, str) or not url.startswith("https://"):
-            raise TransportError("refusing a non-HTTPS URL")
-        failure: str | None = None
+            raise self._refusal("refusing a non-HTTPS URL")
+        bad_url = False
+        host, port = "", 443
+        try:
+            parts = urllib.parse.urlsplit(url)
+            host, port = (parts.hostname or "").lower(), parts.port or 443
+        except ValueError:
+            bad_url = True
+        if bad_url or not host:
+            raise self._refusal("refusing a malformed URL")
+        key_values = [str(v) for k, v in headers.items() if str(k).lower() == "x-api-key" and v]
+        if key_values and (host not in PRIVATE_API_HOSTS or port != 443):   # the proxy changes the ROUTE only
+            raise self._refusal("refusing to send an API key to a host other than api.wallex.ir:443")
+        proxy = self._proxies.route(host, port)
+        target = f"{host}:{port}"
+        trace = RequestTrace(method=method, path=parts.path, host=host, port=port, proxy=proxy)
+        self.last_trace = trace
+
+        def scrub(text: str) -> str:            # transport-level details: no key, no proxy credentials
+            for v in key_values:
+                text = text.replace(v, "***")
+            return self._proxies.scrub(text)
+
+        caught: BaseException | None = None
         resp: Any = None
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
+            if proxy is not None:
+                # Host = the URL's host (what urllib sends without a proxy), then a CONNECT tunnel to
+                # host:port through the proxy, TLS verified for host. The credentials (if any) are moved
+                # into the CONNECT request by urllib and never reach the exchange.
+                req.add_unredirected_header("Host", req.host)
+                auth = proxy.authorization()
+                if auth:
+                    req.add_unredirected_header("Proxy-Authorization", auth)
+                req.set_proxy(proxy.hostport, "https")
+            req.wa_trace = trace                           # read by TracingHTTPSHandler
             resp = self._opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as err:   # any non-2xx (incl. refused redirects)
             resp = err
-        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
-            failure = f"{type(exc).__name__}: {_safe_str(exc)}"
-        except ValueError:                        # message may echo a header value: keep it out
-            failure = "invalid request (ValueError)"
-        if failure is not None:
-            raise TransportError(failure)
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+            caught = exc
+        if caught is not None:                  # classified (and raised) outside the except block
+            diag = diagnose(caught, phase=trace.current_phase, proxy=proxy, target=target, scrub=scrub)
+            caught = None
+            if diag.status is not None and diag.category == PROXY_CONNECT_FAILED:
+                trace.proxy_status = diag.status
+            trace.finish(diag)
+            raise TransportError(diag.message, category=diag.category, hint=diag.hint, phase=diag.phase)
         try:
             status = getattr(resp, "status", None)
             if status is None:
                 status = resp.getcode()
+            trace.status = int(status)
             raw_headers = getattr(resp, "headers", None)
             hdrs = {str(k).lower(): str(v) for k, v in raw_headers.items()} if raw_headers else {}
-            data = self._read_bounded(resp, time.monotonic() + timeout)
+            expected = _framed_length(raw_headers, hdrs, int(status))
+            trace.framing = ("chunked" if "chunked" in hdrs.get("transfer-encoding", "").lower() else
+                             f"content-length {expected}" if isinstance(expected, int) else
+                             "conflicting content-length" if expected == "conflict" else "until close")
+            data = self._read_bounded(resp, time.monotonic() + timeout, budget=timeout, trace=trace,
+                                      expected=expected, proxy=proxy, target=target, scrub=scrub)
         finally:
             try:
                 resp.close()
             except Exception:  # noqa: BLE001 - closing is best effort
                 pass
+        trace.finish()
         return int(status), hdrs, data
 
-    def _read_bounded(self, resp: Any, deadline: float) -> bytes:
+    def _read_bounded(self, resp: Any, deadline: float, *, budget: float | None = None,
+                      trace: RequestTrace | None = None, expected: int | str | None = None,
+                      proxy: Any = None, target: str = "api.wallex.ir:443",
+                      scrub: Any = None) -> bytes:
         if getattr(resp, "fp", True) is None:    # HTTPError without a body
+            if trace is not None:
+                trace.bytes = 0
             return b""
         sock = _socket_of(resp)
         read = getattr(resp, "read1", None)       # at most ONE underlying recv per call
@@ -284,29 +386,48 @@ class UrllibTransport:
             watchdog.start()
         chunks: list[bytes] = []
         total = 0
-        failure: str | None = None
+        timed_out = eof = False
+        caught: BaseException | None = None
         try:
             while total <= self._max:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    failure = "response read deadline exceeded"
+                    timed_out = True
                     break
                 if sock is not None:
                     sock.settimeout(left)         # a single recv can never outlive the deadline
                 chunk = read(min(65536, self._max + 1 - total))
                 if not chunk:
+                    eof = True
                     break
                 chunks.append(chunk)
                 total += len(chunk)
         except (http.client.HTTPException, OSError, ValueError) as exc:
-            failure = f"{type(exc).__name__} while reading the response"
+            caught = exc
         finally:
             if watchdog is not None:
                 watchdog.cancel()
-        if fired.is_set():
-            failure = "response read deadline exceeded"
-        if failure is not None:
-            raise TransportError(failure)
+        if trace is not None:
+            trace.bytes = total
+        diag: Diagnosis | None = None
+        if timed_out or fired.is_set():          # the deadline wins over whatever the abort caused
+            limit = f" of {budget:g} s" if budget is not None else ""
+            diag = Diagnosis(READ_TIMEOUT, f"response read deadline{limit} exceeded after {total} bytes",
+                             hint_for(READ_TIMEOUT, phase=PH_BODY, proxy=proxy, target=target), PH_BODY)
+        elif caught is not None:
+            diag = diagnose(caught, phase=PH_BODY, proxy=proxy, target=target, received=total, scrub=scrub)
+        elif expected == "conflict":
+            diag = Diagnosis(PROTOCOL_ERROR, "conflicting Content-Length headers in the response",
+                             hint_for(PROTOCOL_ERROR, phase=PH_BODY, proxy=proxy, target=target), PH_BODY)
+        elif eof and isinstance(expected, int) and total != expected:
+            diag = Diagnosis(INCOMPLETE_READ, f"response body has {total} bytes but Content-Length says "
+                             f"{expected}: the connection ended early",
+                             hint_for(INCOMPLETE_READ, phase=PH_BODY, proxy=proxy, target=target), PH_BODY)
+        caught = None
+        if diag is not None:
+            if trace is not None:
+                trace.finish(diag)
+            raise TransportError(diag.message, category=diag.category, hint=diag.hint, phase=diag.phase)
         return b"".join(chunks)
 
 
@@ -701,13 +822,14 @@ class WallexClient:
         return _Prepared(route, m, path, url, headers, body)
 
     def _send_once(self, prep: _Prepared) -> _Response:
-        """Exactly one transport call. Any transport failure => ``TransportError`` with a scrubbed
-        message, raised outside the ``except`` block so no original exception is chained."""
+        """Exactly one transport call. Any transport failure => ``TransportError`` with a classified,
+        scrubbed message (``[category] detail | hint: ...``) and ``category`` / ``hint`` / ``phase``
+        attributes, raised outside the ``except`` block so no original exception is chained."""
         self._bucket.acquire()
         if prep.route.write:
             self._order_bucket.acquire()
         started = self._clock.monotonic()
-        failure: str | None = None
+        caught: BaseException | None = None
         result: Any = None
         try:
             # /v1/markets is ~450 KB: give it more time (slow proxies); everything else keeps the
@@ -717,10 +839,19 @@ class WallexClient:
                 timeout = max(timeout, 45.0)
             result = self._transport.request(prep.method, prep.url, prep.headers, prep.body, timeout)
         except Exception as exc:  # noqa: BLE001 - for a write every failure is "outcome unknown"
-            failure = f"{type(exc).__name__}: {_safe_str(exc)}"     # scrubbed in full below
-        if failure is not None:
-            raise TransportError(self._scrub(
-                f"{prep.method} {prep.path}: transport failure: {failure}")[:500])
+            caught = exc
+        if caught is not None:
+            # the UrllibTransport already classified its failure ("[category] detail | hint: ...");
+            # anything else (another transport) is classified here. Scrubbed IN FULL, then truncated.
+            if isinstance(caught, TransportError) and getattr(caught, "category", None) in CATEGORIES:
+                text, category = _safe_str(caught), caught.category
+                hint, phase = _safe_str(caught.hint or ""), caught.phase
+            else:
+                diag = diagnose(caught, scrub=self._scrub)
+                text, category, hint, phase = diag.message, diag.category, diag.hint, diag.phase
+            caught = None
+            raise TransportError(self._scrub(f"{prep.method} {prep.path}: transport failure {text}")[:500],
+                                 category=category, hint=self._scrub(hint)[:300] or None, phase=phase)
         resp = self._coerce(prep, result)
         _log.debug("%s %s -> HTTP %s in %.0f ms", prep.method, self._scrub(prep.path),
                    resp.status, (self._clock.monotonic() - started) * 1000.0)
@@ -881,7 +1012,7 @@ class WallexClient:
             seen.add(id(cur))
             try:
                 cur.args = tuple(self._scrub(a) if isinstance(a, str) else a for a in cur.args)
-                for attr in ("message", "body"):
+                for attr in ("message", "body", "hint", "detail"):
                     val = getattr(cur, attr, None)
                     if isinstance(val, str):
                         setattr(cur, attr, self._scrub(val))

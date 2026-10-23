@@ -11,6 +11,11 @@ If the order fills anyway (a crossing market, a cancel race), the fill goes thro
 path into the live ledger, an ``alert`` is written, the result is ``ok: false``, and the operator is
 told exactly which holdings resulted.
 
+Preconditions (``CanaryRefused``, nothing sent): no KILL, the engine's per-process connectivity +
+reconcile preflight passed (``cli canary`` runs ``reconcile_startup`` then ``engine.preflight``), state
+UNFUNDED/READY, no unresolved order, rules known, enough spendable TMN. The engine re-checks the
+preflight, the kill switch, rules, fee, a fresh non-crossed book and balances before the POST.
+
 Interrupts (SIGINT/SIGTERM/SIGBREAK, via ``should_stop``): before the order is sent the canary is
 refused and nothing is sent; once it rests, the remaining observations are skipped and it is
 cancelled at once. Whatever happens after placement (even an exception), a ``finally`` cancels the
@@ -90,6 +95,10 @@ def run_canary(rt: Any, *, now: float | None = None,
     audit = rt.audit
     if eng.kill_requested():
         raise CanaryRefused("KILL switch present: no order may be sent")
+    if getattr(eng, "require_preflight", False) and not getattr(eng, "preflight_ok", False):
+        raise CanaryRefused("the connectivity + reconcile preflight has not passed in this process (market "
+                            "rules for both symbols, both books fresh and non-crossed, startup "
+                            "reconciliation ok): nothing was sent")
     if rt.sm.state not in (BotState.UNFUNDED, BotState.READY):
         raise CanaryRefused(f"bot state is {rt.sm.state.value}: the canary needs UNFUNDED or READY")
     if store.unresolved_orders():

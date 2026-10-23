@@ -41,6 +41,7 @@ _SECRET_NAME_PARTS = ("secret", "token", "authoriz", "password", "passwd", "pass
 _KEY_TEXT_RE = re.compile(r"(?i)((?:x[-_ ]?)?api[-_ ]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;&}]+")
 _AUTH_TEXT_RE = re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?(?:bearer\s+|basic\s+)?)"
                            r"[^\s\"',;&}]+")
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{0,15}://)(?!\*{3}@)[^\s/]*@")   # proxy credentials
 
 
 class AuditChainError(WallexAgentError):
@@ -55,7 +56,8 @@ def is_secret_name(name: Any) -> bool:
 
 class Scrubber:
     """Redacts literal secrets (raw, JSON-escaped, URL-encoded), ``X-API-Key: ...`` /
-    ``Authorization: ...`` text, and every value stored under a secret-looking key name."""
+    ``Authorization: ...`` text, credentials inside URLs (``http://user:pass@host``), and every value
+    stored under a secret-looking key name."""
 
     def __init__(self, secrets: Iterable[str] = ()) -> None:
         variants: set[str] = set()
@@ -73,6 +75,7 @@ class Scrubber:
             if v in s:
                 s = s.replace(v, REDACTED)
         s = _KEY_TEXT_RE.sub(lambda m: m.group(1) + REDACTED, s)
+        s = _URL_USERINFO_RE.sub(lambda m: m.group(1) + REDACTED + "@", s)
         return _AUTH_TEXT_RE.sub(lambda m: m.group(1) + REDACTED, s)
 
     def contains_secret(self, text: str) -> bool:

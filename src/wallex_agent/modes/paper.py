@@ -17,20 +17,22 @@ from ..clock import Clock, RealClock
 from ..config import Config
 from ..errors import ExchangeError
 from ..exchange.sim import SimExchange
-from ..exchange.wallex import UrllibTransport, WallexClient
+from ..exchange.wallex import WallexClient
 from ..market_data import LiveBookSource
 from ..store import SqliteStore
 from ..types import Mode
-from . import DB_NAME, CachedBookSource, RecordingTransport, Runtime, assemble, new_run_id, runs_dir
+from . import (DB_NAME, CachedBookSource, RecordingTransport, Runtime, assemble, network_transport, new_run_id,
+               runs_dir)
 from .backtest import assumed_fees
 
 
-def public_client(config: Config, *, transport: Any = None, clock: Clock | None = None) -> WallexClient:
-    """Key-less, public-GET-only client (paper, diagnose, fetch-history)."""
+def public_client(config: Config, *, transport: Any = None, clock: Clock | None = None,
+                  max_read_retries: int = 3) -> WallexClient:
+    """Key-less, public-GET-only client (paper, diagnose, fetch-history, net-check)."""
     return WallexClient(None, public_only=True, base_url=config.api_base,
-                        transport=transport if transport is not None
-                        else UrllibTransport(use_env_proxy=config.use_env_proxy),
-                        clock=clock, timeout=config.http_timeout_s, max_rps=config.max_requests_per_s)
+                        transport=transport if transport is not None else network_transport(config),
+                        clock=clock, timeout=config.http_timeout_s, max_rps=config.max_requests_per_s,
+                        max_read_retries=max_read_retries)
 
 
 def build_paper(config: Config, *, transport: Any = None, clock: Clock | None = None,
@@ -40,7 +42,7 @@ def build_paper(config: Config, *, transport: Any = None, clock: Clock | None = 
     cfg = replace(config, mode=Mode.PAPER)
     rid = run_id or new_run_id(Mode.PAPER)
     rdir = Path(run_dir) if run_dir is not None else runs_dir(cfg, Mode.PAPER) / rid
-    inner = transport if transport is not None else UrllibTransport(use_env_proxy=cfg.use_env_proxy)
+    inner = transport if transport is not None else network_transport(cfg)
     recorder = inner if isinstance(inner, RecordingTransport) else (
         RecordingTransport(inner) if record else None)
     client = public_client(cfg, transport=recorder or inner, clock=clk)

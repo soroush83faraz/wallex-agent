@@ -371,3 +371,45 @@ def test_slow_book_fetches_do_not_make_books_look_future_stamped(tmp_path):
     run(rt, max_cycles=2)
     obs = [x["payload"] for x in read_audit(rt.audit.path) if x["kind"] == "observe"]
     assert obs and not any(u.startswith("book_stale") for o in obs for u in o["unknown"])
+
+
+# --------------------------------------------------------------------------- live start: order preflight
+@pytest.mark.parametrize("fault", ["stale_books", "markets_down_after_reconcile"])
+def test_live_runner_refuses_to_start_when_the_preflight_fails(tmp_path, fault):
+    from tests._runner_support import live_like_runtime
+    from wallex_agent.errors import TransportError
+    from wallex_agent.runner import EXIT_UNAVAILABLE
+    rt, sim, _ = live_like_runtime(tmp_path, preflight=False)
+    rt.brain = ScriptedBrain(rt.config, rt.store, rt.clock, trader_script())
+    if fault == "stale_books":
+        sim.inject("stale_book", times=10, age_s=3600)
+    else:
+        real, calls = sim.get_markets, {"n": 0}
+
+        def flaky():
+            calls["n"] += 1                       # the startup reconcile's read works, the preflight's not
+            if calls["n"] > 1:
+                raise TransportError("[read_timeout] slow proxy | hint: x", category="read_timeout")
+            return real()
+        sim.get_markets = flaky
+    r = AgentRunner(rt)
+    res = r.run(max_cycles=3)
+    assert res.status == "unavailable" and res.exit_code == EXIT_UNAVAILABLE and r.cycle == 0
+    assert "preflight failed, no order was sent" in res.reason
+    if fault == "markets_down_after_reconcile":
+        assert "rules_unavailable: TransportError[read_timeout]" in res.reason
+    assert sum(sim.post_counts.values()) == 0 and rt.store.list_orders() == []
+    assert rt.store.kv_get(K_START) is None                  # the competition clock did not start
+    recs = read_audit(rt.audit.path)
+    assert any(x["kind"] == "preflight" and x["payload"]["ok"] is False for x in recs)
+    assert any(x["kind"] == "alert" and x["payload"].get("alert") == "preflight_failed" for x in recs)
+
+
+def test_live_runner_trades_only_after_its_own_preflight(tmp_path):
+    from tests._runner_support import live_like_runtime
+    rt, sim, _ = live_like_runtime(tmp_path, preflight=False)
+    rt.brain = ScriptedBrain(rt.config, rt.store, rt.clock, trader_script())
+    r = AgentRunner(rt)
+    assert not rt.engine.preflight_ok
+    assert r.start() is None and rt.engine.preflight_ok      # reconcile + preflight in start()
+    assert r.run_once() is None and sum(sim.post_counts.values()) >= 1

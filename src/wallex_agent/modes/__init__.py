@@ -101,7 +101,17 @@ def open_snapshot(db_path: str | Path, clock: Clock | None = None) -> _SqlStore:
     return _SqlStore(mem, clock)
 
 
-# --------------------------------------------------------------------------- transport recorder
+# --------------------------------------------------------------------------- transports
+def network_transport(config: Config, *, environ: Mapping[str, str] | None = None) -> Any:
+    """THE production HTTPS transport for ``config`` (every mode and command builds its network
+    transport here): verified TLS, and the route from ``WALLEX_PROXY_URL`` (explicit proxy), else -
+    with ``WALLEX_USE_ENV_PROXY=true`` - HTTPS_PROXY/HTTP_PROXY/NO_PROXY of the process environment,
+    else direct. A malformed proxy setting raises ``ConfigError`` (never a silent direct route)."""
+    from ..exchange.wallex import UrllibTransport
+    return UrllibTransport(use_env_proxy=config.use_env_proxy, proxy_url=config.proxy_url or None,
+                           environ=environ)
+
+
 class RecordingTransport:
     """``Transport`` wrapper that records request METADATA only: method, path, query parameter
     NAMES, whether an ``X-API-Key`` header was attached, HTTP status, body size and JSON key names.
@@ -124,7 +134,7 @@ class RecordingTransport:
             "query_keys": sorted(urllib.parse.parse_qs(parts.query).keys()),
             "with_key": any(str(k).lower() == "x-api-key" for k in headers),
             "has_body": body is not None, "status": None, "bytes": None, "json_keys": None,
-            "result_keys": None, "error": None}
+            "result_keys": None, "error": None, "category": None}
         try:
             if self.responder is not None:
                 status, hdrs, raw = self.responder(method, url, headers, body)
@@ -132,6 +142,8 @@ class RecordingTransport:
                 status, hdrs, raw = self.inner.request(method, url, headers, body, timeout)
         except Exception as exc:
             rec["error"] = type(exc).__name__
+            cat = getattr(exc, "category", None)
+            rec["category"] = cat if isinstance(cat, str) else None
             self.records.append(rec)
             raise
         rec["status"], rec["bytes"] = status, len(raw)
@@ -236,8 +248,11 @@ def assemble(config: Config, mode: Mode, *, run_id: str, run_dir: Path, store: A
                           usdt_symbol=config.usdt_symbol)
     sm = StateMachine(store, clock)
     seed = config.seed if rng_seed is None else rng_seed
+    # every engine that can send REAL orders (live) refuses to send any until its per-process
+    # connectivity + reconcile preflight passed (ExecutionEngine.preflight)
     engine = ExecutionEngine(exchange, store, portfolio, sm, config, clock, None,
-                             rng=random.Random(f"engine:{seed}"))
+                             rng=random.Random(f"engine:{seed}"),
+                             require_preflight=mode is Mode.LIVE or config.mode is Mode.LIVE)
     audit = AuditLog(run_dir / AUDIT_NAME, run_id=audit_run_id or run_id, clock=clock,
                      secrets=[config.api_key] if config.api_key else [], durable=durable_audit)
     engine.audit = EngineAudit(audit)
@@ -267,4 +282,4 @@ def build_runtime(config: Config, mode: Mode | str, **opts: Any) -> Runtime:
 
 __all__ = ["Runtime", "RecordingTransport", "CachedBookSource", "EngineAudit", "assemble", "build_runtime",
            "mode_dir", "runs_dir", "live_store_path", "new_run_id", "last_run", "write_last_run", "run_paths",
-           "open_snapshot", "LAST_RUN_FILE", "DB_NAME", "AUDIT_NAME"]
+           "open_snapshot", "network_transport", "LAST_RUN_FILE", "DB_NAME", "AUDIT_NAME"]

@@ -439,3 +439,148 @@ def test_audit_payloads_are_json_and_null_audit_works(tmp_path):
     w.engine.audit = NullAudit()
     w.engine.submit(w.exit())
     assert isinstance(w.audit, ListAudit)
+
+
+# --------------------------------------------------------------------------- order preflight (live engines)
+def live_world(tmp_path, **kw):
+    """A world whose engine is a LIVE one (config mode live): orders would be real."""
+    from wallex_agent.types import Mode
+    return make_world(tmp_path, mode=Mode.LIVE, **kw)
+
+
+def posts(w):
+    return sum(w.sim.post_counts.values())
+
+
+def convert_intent():
+    return TradeIntent("convert", Side.BUY, USD, D("10"), D("272000"), D("30"))
+
+
+def assert_nothing_can_be_sent(w):
+    res = w.engine.submit(convert_intent())
+    assert res.status == "blocked" and res.reason.startswith("preflight_missing"), res
+    conv = w.engine.convert_tmn_to_usdt()
+    assert conv.status == "blocked" and conv.notes and conv.notes[0].startswith("preflight_missing")
+    assert posts(w) == 0 and w.store.list_orders() == []
+
+
+def test_a_live_engine_sends_nothing_until_its_preflight_passed_in_this_process(tmp_path):
+    w = live_world(tmp_path)
+    assert w.engine.require_preflight and not w.engine.preflight_ok
+    assert_nothing_can_be_sent(w)
+    pf = w.engine.preflight()                                   # (c) no startup reconcile yet
+    assert not pf["ok"] and any(p.startswith("startup_reconcile_not_ok") for p in pf["problems"])
+    assert_nothing_can_be_sent(w)
+    assert w.engine.reconcile_startup()["ok"]
+    pf = w.engine.preflight()
+    assert pf["ok"] and set(pf["rules"]) == set(pf["books"]) == {BTC, USD} and w.engine.preflight_ok
+    assert w.audit.of("preflight")[-1]["ok"] is True and json.dumps(w.audit.of("preflight"))
+    assert w.engine.convert_tmn_to_usdt().status == "done" and posts(w) == 1
+    w.restart()                                                 # a new process: the pass is not stored
+    assert w.engine.require_preflight and not w.engine.preflight_ok
+    assert w.engine.submit(w.entry()).reason.startswith("preflight_missing")
+
+
+def _crossed_book(w, symbol):
+    from wallex_agent.types import BookLevel, OrderBook
+    return OrderBook(symbol, (BookLevel(D("272100"), D("5")),), (BookLevel(D("272000"), D("5")),), w.clock.now())
+
+
+@pytest.mark.parametrize("fault,token", [
+    ("markets_down", "rules_unavailable: TransportError"), ("rules_missing", "rules_unknown: BTCUSDT"),
+    ("book_down", "book_unavailable: BTCUSDT TransportError"), ("book_stale", "book_stale: USDTTMN"),
+    ("book_crossed", "book_crossed: USDTTMN"), ("stopped", "bot_stopped")])
+def test_no_order_is_attempted_when_rules_books_or_reconcile_fail_the_preflight(tmp_path, monkeypatch, fault, token):
+    from wallex_agent.errors import TransportError
+    w = live_world(tmp_path)
+    assert w.engine.reconcile_startup()["ok"]
+    sim = w.sim
+    if fault == "markets_down":
+        sim.inject("network_down")                              # the preflight's markets read fails
+    elif fault == "rules_missing":
+        sim.rules.pop(BTC)
+    elif fault == "book_down":
+        real = sim.get_order_book
+        monkeypatch.setattr(sim, "get_order_book", lambda s: (_ for _ in ()).throw(
+            TransportError("x", category="read_timeout")) if s == BTC else real(s))
+    elif fault == "book_stale":
+        sim.inject("stale_book", age_s=3600)
+    elif fault == "book_crossed":
+        real = sim.get_order_book
+        monkeypatch.setattr(sim, "get_order_book", lambda s: _crossed_book(w, s) if s == USD else real(s))
+    elif fault == "stopped":
+        w.sm.transition(S.STOPPED, "test")
+    pf = w.engine.preflight()
+    assert not pf["ok"] and any(p.startswith(token) for p in pf["problems"]), pf["problems"]
+    assert_nothing_can_be_sent(w)
+    if fault == "book_down":                                    # the transport category is kept
+        assert any("TransportError[read_timeout]" in p for p in pf["problems"])
+
+
+def test_the_send_path_rechecks_the_preflight_before_persisting_anything(tmp_path, monkeypatch):
+    w = live_world(tmp_path)
+    monkeypatch.setattr(w.engine, "_blocker", lambda intent: None)     # a hypothetical blocker bug
+    res = w.engine.submit(convert_intent())
+    assert res.status == "declined" and "preflight_missing" in res.reason
+    assert posts(w) == 0 and w.store.list_orders() == []
+
+
+def test_a_failed_preflight_or_a_new_reconcile_withdraws_the_permission(tmp_path):
+    w = live_world(tmp_path)
+    assert w.engine.reconcile_startup()["ok"] and w.engine.preflight()["ok"]
+    w.sim.inject("network_down")
+    assert not w.engine.preflight()["ok"] and not w.engine.preflight_ok
+    assert w.engine.submit(convert_intent()).status == "blocked"
+    assert w.engine.preflight()["ok"]
+    assert w.engine.reconcile_startup()["ok"] and not w.engine.preflight_ok     # needs a new preflight
+    assert w.engine.submit(convert_intent()).status == "blocked" and posts(w) == 0
+
+
+def test_the_preflight_never_blocks_cancelling_or_killing(tmp_path):
+    """Emergency paths stay open: a new process whose preflight is missing (or failing) still cancels
+    the resting orders of the bot (kill / cancel-open / shutdown) - cancel only, nothing new is sent."""
+    w = live_world(tmp_path)
+    assert w.engine.reconcile_startup()["ok"] and w.engine.preflight()["ok"]
+    assert w.engine.convert_tmn_to_usdt().status == "done"
+    res = w.engine.submit(w.entry(style="passive_limit"))
+    assert res.status == "open"
+    oid = res.order_ids[0]
+    w.restart()                                                    # new process: no preflight yet
+    w.sim.inject("network_down")
+    assert not w.engine.preflight()["ok"]
+    before = posts(w)
+    out = w.engine.kill(cancel_open=True, reason="test")
+    assert oid in out["cancelled"] and posts(w) == before
+    assert w.store.get_order(oid).lifecycle is L.CANCELED and w.sm.state is S.STOPPED
+
+
+def test_simulated_engines_keep_working_without_a_preflight(tmp_path):
+    w = make_world(tmp_path)                    # paper/backtest config: SimExchange, nothing is ever sent
+    assert not w.engine.require_preflight and w.engine.convert_tmn_to_usdt().status == "done"
+
+
+def test_unknown_outcome_alert_carries_the_classified_transport_failure_without_the_key(tmp_path):
+    """Root-cause visibility: the POST fails in the REAL client (transport timeout after sending) ->
+    the engine's unknown_outcome alert and the order note name the category; the key appears nowhere."""
+    import socket
+    from wallex_agent.clock import SimClock
+    from wallex_agent.exchange.wallex import WallexClient
+    key = "SENTINELKEY-Q7xZ9wPv3Lm8/Rk2+Tz=Hq4"
+
+    class Timeout:
+        posts = 0
+
+        def request(self, method, *a, **k):
+            Timeout.posts += method == "POST"
+            raise socket.timeout(f"timed out {key}")
+    client = WallexClient(key, transport=Timeout(), clock=SimClock(), max_read_retries=0)
+    w = funded_world(tmp_path)
+    w.sim.create_order = client.create_order          # the POST goes through the real client and fails
+    w.engine.submit(w.entry())
+    (alert,) = [p for k, p in w.audit.records if k == "ALERT" and p.get("alert") == "unknown_outcome"]
+    assert alert["category"] == "read_timeout" and alert["error"] == "TransportError"
+    assert alert["message"].startswith("POST /v1/account/orders: transport failure [read_timeout]")
+    assert "did not arrive in time" in alert["hint"] and "never resent" in alert["hint"]
+    rec = [o for o in w.store.list_orders() if o.purpose == "entry"][0]
+    assert Timeout.posts == 1 and rec.lifecycle is L.ABANDONED      # resolved from facts, never resent
+    assert key not in json.dumps(w.audit.records) and key not in json.dumps([o.note for o in w.store.list_orders()])

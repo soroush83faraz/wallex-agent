@@ -17,8 +17,8 @@ from wallex_agent.reporting import Scrubber, verify_chain
 from wallex_agent.runner import (EXIT_GATE, EXIT_INTERRUPTED, EXIT_KILLED, EXIT_OK, EXIT_REFUSED,
                                  EXIT_STOPPED, EXIT_UNAVAILABLE, EXIT_USAGE)
 
-COMMANDS = ["demo", "backtest", "fetch-history", "diagnose", "paper", "check-live", "canary", "selftest",
-            "arm-live", "live", "status", "kill", "unstop", "report", "trace"]
+COMMANDS = ["demo", "backtest", "fetch-history", "diagnose", "net-check", "paper", "check-live", "canary",
+            "selftest", "arm-live", "live", "status", "kill", "unstop", "report", "trace"]
 
 
 def env_for(tmp_path, **kw):
@@ -156,6 +156,125 @@ def test_fetch_history_writes_candles(capsys, tmp_path):
                            tmp_path, transport=recording_public_transport(), clock=SimClock(1_792_670_000.0))
     assert code == EXIT_OK and dest.is_file() and "candles" in out
     assert dest.read_text(encoding="utf-8").startswith("time,open,high,low,close,volume")
+
+
+# --------------------------------------------------------------------------- net-check
+BALANCE = "987654321.123"
+
+
+def _net_responder(*, crossed_btc=False):
+    """Public fixtures + the private GETs (key required). Every non-GET is a test failure."""
+    from urllib.parse import urlsplit
+    from tests._runner_support import public_responder
+    pub = public_responder()
+    docs = {"/v1/account/balances": {"balances": {"TMN": {"asset": "TMN", "faName": "t", "fiat": True,
+                                                          "value": BALANCE, "locked": "0"}}},
+            "/v1/account/fee": {s: {"makerFeeRate": "0.0025", "takerFeeRate": "0.0025", "recent_days_sum": 0}
+                                for s in ("BTCUSDT", "USDTTMN")},
+            "/v1/account/openOrders": {"orders": []}, "/v1/account/trades": {"AccountLatestTrades": []}}
+
+    def respond(method, url, headers, body):
+        assert method == "GET", f"net-check sent {method}"
+        parts = urlsplit(url)
+        if parts.path in docs:
+            assert headers.get("X-API-Key") == SENTINEL
+            return 200, {}, json.dumps({"success": True, "message": "ok", "result": docs[parts.path]}).encode()
+        if crossed_btc and parts.path == "/v1/depth" and "BTCUSDT" in parts.query:
+            book = {"bid": [{"price": "81000", "quantity": "1"}], "ask": [{"price": "80000", "quantity": "1"}]}
+            return 200, {}, json.dumps({"success": True, "message": "ok", "result": book}).encode()
+        return pub(method, url, headers, body)
+    return respond
+
+
+class _Opener:
+    """urllib opener double for a real UrllibTransport: every request fails with ``exc``."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    def open(self, req, timeout=None):
+        raise self.exc
+
+
+def test_net_check_public_only_passes_with_rules_books_and_only_gets(capsys, tmp_path):
+    tr = recording_public_transport()
+    code, out, err = run_cli(capsys, ["net-check", "--json"], tmp_path, env={"DATA_DIR": str(tmp_path / "s")},
+                             transport=tr, clock=SimClock(1_700_000_000.0))
+    assert code == EXIT_OK, out + err
+    text, js = out[: out.index("\n{")], out[out.index("\n{") + 1:]
+    assert "rules USDTTMN: price decimals 0, qty decimals 2, minQty 0.01 USDT, minNotional 50000 TMN" in text
+    assert "rules BTCUSDT: price decimals 2, qty decimals 8" in text and text.count("NOT crossed") == 2
+    assert "[SKIP] private GETs: no WALLEX_API_KEY" in text and "net-check: PASS" in text
+    doc = json.loads(js)
+    assert doc["ok"] is True and doc["exit_code"] == 0 and {s["step"] for s in doc["steps"]} >= {
+        "GET /v1/markets", "GET /v1/depth?symbol=USDTTMN", "GET /v1/depth?symbol=BTCUSDT"}
+    recs = list(tr.records)
+    assert {r["method"] for r in recs} == {"GET"} and not any(r["with_key"] for r in recs)
+    assert {r["path"] for r in recs} == {"/v1/markets", "/v1/depth"}
+
+
+def test_net_check_with_a_key_uses_read_only_gets_and_prints_no_key_and_no_balance(capsys, tmp_path):
+    from wallex_agent.modes import RecordingTransport
+    tr = RecordingTransport(responder=_net_responder())
+    code, out, err = run_cli(capsys, ["net-check", "--json"], tmp_path, transport=tr, clock=SimClock(1_700_000_000.0))
+    assert code == EXIT_OK, out + err
+    assert "[PASS] GET /v1/account/balances: 1 assets (amounts not shown)" in out
+    assert "fee known for USDTTMN, BTCUSDT" in out and "0 open orders" in out and "0 recent trades" in out
+    assert SENTINEL not in out + err and BALANCE not in out + err and "987654321" not in out + err
+    recs = list(tr.records)
+    assert {r["method"] for r in recs} == {"GET"}                         # read-only: never a POST/DELETE
+    assert {r["path"] for r in recs if r["with_key"]} == {
+        "/v1/account/balances", "/v1/account/fee", "/v1/account/openOrders", "/v1/account/trades"}
+
+
+def test_net_check_network_failure_exits_7_with_category_and_hint(capsys, tmp_path):
+    from wallex_agent.exchange.wallex import UrllibTransport
+    tr = UrllibTransport(opener=_Opener(socket.timeout("timed out")))
+    code, out, err = run_cli(capsys, ["net-check"], tmp_path, env={"DATA_DIR": str(tmp_path / "s")}, transport=tr)
+    assert code == EXIT_UNAVAILABLE
+    assert "route:  DIRECT to api.wallex.ir:443 (no proxy configured)" in out
+    assert "[FAIL] GET /v1/markets: read_timeout: timed out while waiting for the response headers" in out
+    assert "hint: connected, but the response did not arrive in time" in out
+    assert "a NETWORK step failed (exit 7)" in out
+
+
+def test_net_check_crossed_book_exits_6(capsys, tmp_path):
+    from wallex_agent.modes import RecordingTransport
+    code, out, _ = run_cli(capsys, ["net-check"], tmp_path, env={"DATA_DIR": str(tmp_path / "s")},
+                           transport=RecordingTransport(responder=_net_responder(crossed_btc=True)),
+                           clock=SimClock(1_700_000_000.0))
+    assert code == EXIT_REFUSED
+    assert "[FAIL] GET /v1/depth?symbol=BTCUSDT: invalid_response:" in out and "crossed" in out
+    assert "the network works, a check failed (exit 6)" in out
+
+
+def test_net_check_shows_an_ignored_environment_proxy_and_masks_every_proxy(capsys, tmp_path):
+    from wallex_agent.exchange.wallex import UrllibTransport
+    pw = "Pr0xyPassw0rd"
+    env_tr = UrllibTransport(opener=_Opener(socket.timeout()), use_env_proxy=False,
+                             environ={"HTTPS_PROXY": f"http://op:{pw}@127.0.0.1:2080"})
+    code, out, err = run_cli(capsys, ["net-check"], tmp_path, env={"DATA_DIR": str(tmp_path / "s")}, transport=env_tr)
+    assert code == EXIT_UNAVAILABLE and "route:  DIRECT" in out
+    assert "HTTPS_PROXY set in the environment but NOT used (WALLEX_USE_ENV_PROXY is not true" in out
+    via = UrllibTransport(opener=_Opener(urllib_error_refused()), proxy_url=f"http://op:{pw}@127.0.0.1:2080")
+    code2, out2, err2 = run_cli(capsys, ["net-check"], tmp_path, transport=via)
+    assert code2 == EXIT_UNAVAILABLE
+    assert "route:  proxy http://***@127.0.0.1:2080 (from WALLEX_PROXY_URL) -> CONNECT api.wallex.ir:443" in out2
+    assert "proxy_unreachable" in out2 and "the PROXY's exit IP" in out2
+    assert pw not in out + err + out2 + err2 and "op:" not in out + out2
+
+
+def urllib_error_refused():
+    import urllib.error
+    return urllib.error.URLError(ConnectionRefusedError(10061, "refused"))
+
+
+def test_net_check_usage_and_configuration_errors(capsys, tmp_path):
+    code, _, err = run_cli(capsys, ["net-check", "--repeat", "11"], tmp_path, transport=recording_public_transport())
+    assert code == EXIT_USAGE and "--repeat" in err
+    code, out, err = run_cli(capsys, ["net-check"], tmp_path,
+                             env={"DATA_DIR": str(tmp_path / "s"), "WALLEX_PROXY_URL": "socks5://op:Zz9Secret@h:1"})
+    assert code == EXIT_USAGE and "WALLEX_PROXY_URL" in err and "Zz9Secret" not in out + err
 
 
 # --------------------------------------------------------------------------- live gates

@@ -8,9 +8,14 @@
 * ``build_cancel_only_runtime`` - for ``kill --cancel-open``: the client is wrapped in
   ``CancelOnlyExchange``, whose ``create_order`` refuses locally, so it can only read and cancel.
 
-Everything else that needs the key (``check-live``, ``unstop`` via ``build_unstop_runtime``) gets
-``read_only=True`` (no POST/DELETE possible). ``tests/test_modes.py`` greps the source tree to keep it
-that way.
+Everything else that needs the key (``check-live``, ``net-check``, ``unstop`` via
+``build_unstop_runtime``) gets ``read_only=True`` (no POST/DELETE possible). ``tests/test_modes.py``
+greps the source tree to keep it that way. Every transport comes from ``modes.network_transport``
+(verified TLS; route from WALLEX_PROXY_URL / the opted-in environment proxy; the key's host lock to
+api.wallex.ir:443 is unchanged: a proxy only changes the route).
+
+Live engines require a per-process connectivity + reconcile preflight (``ExecutionEngine.preflight``)
+before ANY order: ``runner.start`` and ``canary`` run it after ``reconcile_startup``.
 """
 from __future__ import annotations
 
@@ -23,12 +28,12 @@ from ..clock import Clock, RealClock
 from ..config import Config
 from ..errors import ForbiddenEndpointError, LiveNotAllowedError
 from ..exchange.probe import unverified_after_canary
-from ..exchange.wallex import UrllibTransport, WallexClient
+from ..exchange.wallex import WallexClient
 from ..execution import K_RUN
 from ..market_data import LiveBookSource
 from ..store import SqliteStore
 from ..types import Mode
-from . import RecordingTransport, Runtime, assemble, live_store_path, open_snapshot, runs_dir
+from . import RecordingTransport, Runtime, assemble, live_store_path, network_transport, open_snapshot, runs_dir
 from .paper import public_client
 
 K_COMPETITION_START = "runner.competition_start"   # (runner.py owns the key; read here to detect a resume)
@@ -36,7 +41,7 @@ K_COMPETITION_START = "runner.competition_start"   # (runner.py owns the key; re
 
 # --------------------------------------------------------------------------- clients
 def _transport(config: Config, transport: Any) -> RecordingTransport:
-    inner = transport if transport is not None else UrllibTransport(use_env_proxy=config.use_env_proxy)
+    inner = transport if transport is not None else network_transport(config)
     return inner if isinstance(inner, RecordingTransport) else RecordingTransport(inner)
 
 
@@ -47,12 +52,14 @@ def _keyed_write_client(config: Config, transport: Any, clock: Clock) -> WallexC
                         order_rps=config.order_requests_per_s)
 
 
-def read_only_client(config: Config, *, transport: Any = None, clock: Clock | None = None) -> WallexClient:
-    """Keyed but GET-only (``check-live``): every POST/DELETE raises before any I/O."""
+def read_only_client(config: Config, *, transport: Any = None, clock: Clock | None = None,
+                     max_read_retries: int = 3) -> WallexClient:
+    """Keyed but GET-only (``check-live``, ``net-check``, ``unstop``): every POST/DELETE raises
+    ``ForbiddenEndpointError`` before any I/O."""
     return WallexClient(config.api_key, read_only=True, base_url=config.api_base,
-                        transport=transport if transport is not None
-                        else UrllibTransport(use_env_proxy=config.use_env_proxy),
-                        clock=clock, timeout=config.http_timeout_s, max_rps=config.max_requests_per_s)
+                        transport=transport if transport is not None else network_transport(config),
+                        clock=clock, timeout=config.http_timeout_s, max_rps=config.max_requests_per_s,
+                        max_read_retries=max_read_retries)
 
 
 class CancelOnlyExchange:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .errors import ConfigError
+from .exchange.net import parse_proxy_url
 from .types import Mode, dec
 
 FINAL_POLICIES = ("report_only", "flatten_to_usdt", "flatten_to_tmn")
@@ -55,7 +56,12 @@ class Config:
     api_base: str = "https://api.wallex.ir"
     api_key: str = field(default="", repr=False)   # secret: never logged / reported
     enable_live: bool = False
-    use_env_proxy: bool = False                     # honour HTTP(S)_PROXY (changes source IP!)
+    # Network route (both change the source IP the exchange sees!). ``proxy_url`` = WALLEX_PROXY_URL,
+    # an explicit http://[user:pass@]host:port CONNECT proxy that wins over the environment (may hold
+    # credentials: hidden from repr, masked in ``redacted()``). ``use_env_proxy`` = also honour
+    # HTTPS_PROXY / HTTP_PROXY / NO_PROXY of the process environment. The OS proxy settings never apply.
+    use_env_proxy: bool = False
+    proxy_url: str = field(default="", repr=False)
 
     # ---- competition
     initial_tmn: Decimal = Decimal("5000000")
@@ -142,16 +148,32 @@ class Config:
         need(0 < self.max_requests_per_s <= 20 and 0 < self.order_requests_per_s <= 5,
              "rate limits: max_requests_per_s in (0,20], order_requests_per_s in (0,5]")
         need(bool(str(self.data_dir).strip()), "data_dir must not be empty")
+        if self.proxy_url:
+            parse_proxy_url(self.proxy_url, source="WALLEX_PROXY_URL")   # ConfigError, never echoes it
         if self.mode is Mode.LIVE:
             need(bool(self.api_key), "live mode needs WALLEX_API_KEY in the environment/.env")
         return self
+
+    @property
+    def proxy_display(self) -> str:
+        """``WALLEX_PROXY_URL`` with any credentials masked (``http://***@host:port``), or ''."""
+        if not self.proxy_url:
+            return ""
+        try:
+            return parse_proxy_url(self.proxy_url, source="WALLEX_PROXY_URL").display
+        except ConfigError:
+            return "<invalid>"
 
     def redacted(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
         for f in fields(self):
             v = getattr(self, f.name)
-            d[f.name] = ("***set***" if v else "") if f.name == "api_key" else (
-                str(v) if isinstance(v, (Decimal, Path)) else (v.value if isinstance(v, Mode) else v))
+            if f.name == "api_key":
+                d[f.name] = "***set***" if v else ""
+            elif f.name == "proxy_url":
+                d[f.name] = self.proxy_display
+            else:
+                d[f.name] = str(v) if isinstance(v, (Decimal, Path)) else (v.value if isinstance(v, Mode) else v)
         return d
 
 
@@ -172,6 +194,7 @@ _ENV: dict[str, tuple[str, Any]] = {
     "DATA_DIR": ("data_dir", str),
     "API_BASE": ("api_base", str),
     "WALLEX_USE_ENV_PROXY": ("use_env_proxy", _b),
+    "WALLEX_PROXY_URL": ("proxy_url", str),
     "PAPER_FEE_RATE": ("paper_fee_rate", dec),
     "STOP_LOSS_PCT": ("stop_loss_pct", dec),
     "MAX_DRAWDOWN_PCT": ("max_drawdown_pct", dec),

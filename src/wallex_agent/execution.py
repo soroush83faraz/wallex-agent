@@ -20,6 +20,11 @@ Guarantees (each enforced here and tested with ``SimExchange`` fault injection):
   ``get_trades`` rows, else are estimated and flagged ``fee_source='estimated'``.
 * bot state transitions follow observed facts; ``*_PENDING`` only while an order is in flight/active.
 * kill switch (``<data_dir>/KILL`` or in-process) is checked before every send; ``kill`` only cancels.
+* order preflight (``require_preflight``: every LIVE engine): NO order is sent until ``preflight()``
+  passed in THIS process (the flag lives only in this object, never in the store): market rules for
+  both symbols fetched and valid, both books fresh and non-crossed, and a ``reconcile_startup`` of this
+  engine returned ok. ``submit`` is blocked (``preflight_missing``) and ``convert_tmn_to_usdt`` refuses
+  until then; the check is repeated right before ``create_order``.
 """
 from __future__ import annotations
 
@@ -32,12 +37,12 @@ from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from .clock import Clock
 from .config import Config
-from .errors import ExchangeError, InvariantError, KillSwitchActive, OrderNotFound, RejectedError
+from .errors import ExchangeError, InvariantError, KillSwitchActive, OrderNotFound, RejectedError, error_label
 from .portfolio import Portfolio
 from .risk import RiskContext, RiskGate
 from .state import StateMachine, derive_state_explained
 from .store import FillRecord, OrderRecord
-from .types import (BPS, ONE, ORDER_TRANSITIONS, ZERO, Balance, BotState, MarketRules, OrderBook,
+from .types import (BPS, ONE, ORDER_TRANSITIONS, ZERO, Balance, BotState, MarketRules, Mode, OrderBook,
                     OrderInfo, OrderLifecycle as L, OrderRequest, OrderStatus, Side, Trade, TradeIntent,
                     plain, quantize_down, quantize_up)
 
@@ -215,7 +220,13 @@ def _info_dict(info: OrderInfo) -> dict[str, Any]:
 class ExecutionEngine:
     def __init__(self, exchange: Any, store: Any, portfolio: Portfolio, state_machine: StateMachine,
                  config: Config, clock: Clock, audit: AuditSink | None = None, *,
-                 tolerance: Mapping[str, Decimal] | None = None, rng: random.Random | None = None) -> None:
+                 tolerance: Mapping[str, Decimal] | None = None, rng: random.Random | None = None,
+                 require_preflight: bool | None = None) -> None:
+        # None => required exactly when the orders are REAL (live); simulated engines may opt in
+        self.require_preflight = (getattr(config, "mode", None) is Mode.LIVE if require_preflight is None
+                                  else bool(require_preflight))
+        self._startup_ok = False        # a reconcile_startup() of THIS object returned ok
+        self._preflight_ok = False      # a preflight() of THIS object passed (never persisted)
         self.exchange = exchange
         self.store = store
         self.portfolio = portfolio
@@ -306,7 +317,7 @@ class ExecutionEngine:
             try:
                 self._rules_cache = dict(self.exchange.get_markets())
             except Exception as exc:
-                raise _Decline("rules_unavailable", type(exc).__name__) from exc
+                raise _Decline("rules_unavailable", error_label(exc)) from exc
         r = self._rules_cache.get(symbol)
         if r is None:
             raise _Decline("rules_unknown", symbol)
@@ -317,7 +328,7 @@ class ExecutionEngine:
             try:
                 self._fees_cache = dict(self.exchange.get_fees())
             except Exception as exc:
-                raise _Decline("fee_unavailable", type(exc).__name__) from exc
+                raise _Decline("fee_unavailable", error_label(exc)) from exc
         f = self._fees_cache.get(symbol)
         if f is None:
             raise _Decline("fee_unknown", symbol)
@@ -330,7 +341,7 @@ class ExecutionEngine:
         try:
             book = self.exchange.get_order_book(symbol)
         except Exception as exc:
-            raise _Decline("book_unavailable", type(exc).__name__) from exc
+            raise _Decline("book_unavailable", f"{symbol} {error_label(exc)}") from exc
         if not book.bids or not book.asks:
             raise _Decline("book_missing", symbol)
         if book.best_bid >= book.best_ask:
@@ -344,7 +355,55 @@ class ExecutionEngine:
         try:
             return dict(self.exchange.get_balances())
         except Exception as exc:
-            raise _Decline("balances_unavailable", type(exc).__name__) from exc
+            raise _Decline("balances_unavailable", error_label(exc)) from exc
+
+    # ------------------------------------------------------------------ order preflight (per process)
+    @property
+    def preflight_ok(self) -> bool:
+        return self._preflight_ok
+
+    def _preflight_problem(self) -> str | None:
+        if self.require_preflight and not self._preflight_ok:
+            return ("preflight_missing: no order before the connectivity + reconcile preflight has passed "
+                    "in this process (market rules for both symbols, both books fresh and non-crossed, "
+                    "startup reconciliation ok)")
+        return None
+
+    def preflight(self) -> dict[str, Any]:
+        """Connectivity + reconcile preflight; the gate of every order of a ``require_preflight`` engine.
+        Passes only if (c) ``reconcile_startup`` of THIS engine returned ok and the bot is not STOPPED,
+        (a) the market rules of both symbols are fetched NOW (one ``get_markets``) and sane, and (b) both
+        books are fetched now, non-empty, non-crossed and fresh (``max_book_age_s``). The result is kept
+        in this object only (a restart needs a new preflight); a failed run clears an earlier pass."""
+        cfg = self.config
+        syms = (cfg.usdt_symbol, cfg.btc_symbol)
+        out: dict[str, Any] = {"ok": False, "problems": [], "rules": {}, "books": {}}
+        problems: list[str] = out["problems"]
+        if not self._startup_ok:
+            problems.append("startup_reconcile_not_ok: reconcile_startup has not returned ok in this process")
+        if self.sm.state is BotState.STOPPED:
+            problems.append("bot_stopped")
+        try:
+            self._rules(syms[0], refresh=True)              # ONE /v1/markets read for both symbols
+            for s in syms:
+                r = self._rules(s)
+                if not (0 <= r.price_decimals <= 18 and 0 <= r.qty_decimals <= 18 and r.min_qty > 0
+                        and r.min_notional >= 0 and r.symbol == s):
+                    problems.append(f"rules_invalid: {s}")
+                out["rules"][s] = {"price_decimals": r.price_decimals, "qty_decimals": r.qty_decimals,
+                                   "min_qty": r.min_qty, "min_notional": r.min_notional}
+        except _Decline as d:
+            problems.append(str(d))
+        for s in syms:
+            try:
+                b = self._fresh_book(s)
+                out["books"][s] = {"bid": b.best_bid, "ask": b.best_ask, "age_s": round(b.age(self._now()), 3)}
+            except _Decline as d:
+                problems.append(str(d))
+        out["ok"] = not problems
+        self._preflight_ok = bool(out["ok"])
+        self._audit("preflight", out)
+        return out
 
     # ------------------------------------------------------------------ quarantine
     def quarantined(self) -> frozenset[tuple[str, Side]]:
@@ -576,6 +635,9 @@ class ExecutionEngine:
         return None
 
     def _blocker(self, intent: TradeIntent) -> str | None:
+        missing = self._preflight_problem()
+        if missing:
+            return missing
         if self.sm.state is BotState.STOPPED:
             return "bot_stopped"
         if self.store.unresolved_orders():
@@ -695,7 +757,7 @@ class ExecutionEngine:
         try:
             trades = self.exchange.get_trades(symbol, side)
         except Exception as exc:
-            raise _Decline("trades_unavailable", type(exc).__name__) from exc
+            raise _Decline("trades_unavailable", error_label(exc)) from exc
 
         def bv(a: str) -> list[str]:
             b = bals.get(a)
@@ -756,6 +818,9 @@ class ExecutionEngine:
         symbol, side = intent.symbol, intent.side
         snapshot = self._snapshot(symbol, side)
         self._assert_not_killed()
+        missing = self._preflight_problem()       # (also checked in _blocker) nothing persisted yet
+        if missing:
+            raise _Decline("preflight_missing", missing.split(": ", 1)[-1])
         to_state = self._pending_state(intent)
         with self.store.transaction():
             cid = self._new_client_id()
@@ -783,9 +848,13 @@ class ExecutionEngine:
         except Exception as exc:   # anything else on a write: outcome UNKNOWN, never re-sent
             self._maybe_crash("after_post")
             self.store.update_order(cid, lifecycle=L.UNKNOWN_OUTCOME,
-                                    note=f"POST outcome unknown: {type(exc).__name__}: {str(exc)[:160]}")
+                                    note=f"POST outcome unknown: {error_label(exc)}: {str(exc)[:160]}")
+            # the client scrubs secrets; category/hint are the transport's classified, secret-free diagnosis
+            cat, hint = getattr(exc, "category", None), getattr(exc, "hint", None)
             self._alert("unknown_outcome", {"client_id": cid, "error": type(exc).__name__,
-                                              "message": str(exc)[:200]})   # client scrubs secrets
+                                              "category": cat if isinstance(cat, str) else None,
+                                              "message": str(exc)[:300],
+                                              "hint": hint[:200] if isinstance(hint, str) else None})
             self.resolve_unknown(self.store.get_order(cid))
             return "resolved", self.store.get_order(cid), None
         self._maybe_crash("after_post")
@@ -1233,6 +1302,11 @@ class ExecutionEngine:
         usd, btc = cfg.usdt_symbol, cfg.btc_symbol
         out = ConversionResult(status="nothing_to_convert")
         self._assert_not_killed()
+        missing = self._preflight_problem()
+        if missing:                       # no round may run (submit would block each one anyway)
+            out.status = "blocked"
+            out.notes.append(missing)
+            return self._conversion_totals(out)
         for rnd in range(1, max_rounds + 1):
             self._wait_for_orders(usd, should_stop)
             if self.sm.state is BotState.STOPPED:
@@ -1339,6 +1413,8 @@ class ExecutionEngine:
     def reconcile_startup(self) -> dict[str, Any]:
         """Resolve every unresolved order against the exchange, look for unknown open orders, compare
         the fill ledger with real balances and confirm the bot state. Unexplained drift => STOPPED."""
+        self._startup_ok = False          # set again below only if THIS reconcile ends ok
+        self._preflight_ok = False
         report: dict[str, Any] = {"ok": False, "actions": [], "drift": None}
         report["poll"] = self.poll_and_manage(check_balances=False)    # the strict check is below
         cfg = self.config
@@ -1349,7 +1425,7 @@ class ExecutionEngine:
             opens = [o for o in self.exchange.list_open_orders()
                      if o.symbol in (cfg.btc_symbol, cfg.usdt_symbol)]
         except Exception as exc:
-            report["actions"].append(f"open_orders_unavailable: {type(exc).__name__}")
+            report["actions"].append(f"open_orders_unavailable: {error_label(exc)}")
             return report
         for o in opens:
             rec = self.store.find_order_by_exchange_id(o.client_order_id)
@@ -1370,8 +1446,9 @@ class ExecutionEngine:
             self._contradiction(f"ledger/exchange shortfall at startup: {drift_text(rr)}",
                                 {"reasons": rr.reasons})
         if self.sm.state is not BotState.STOPPED:
-            try:
-                rules = {s: self._rules(s, refresh=True) for s in (cfg.btc_symbol, cfg.usdt_symbol)}
+            try:      # ONE /v1/markets read (~450 KB) serves both symbols
+                rules = {s: self._rules(s, refresh=(i == 0))
+                         for i, s in enumerate((cfg.btc_symbol, cfg.usdt_symbol))}
             except _Decline as d:
                 report["actions"].append(str(d))
                 report["state"] = self.sm.state.value
@@ -1398,6 +1475,7 @@ class ExecutionEngine:
                                         {"persisted": cur.value, "derived": derived.value, "why": why})
         report["state"] = self.sm.state.value
         report["ok"] = self.sm.state is not BotState.STOPPED and rr.ok
+        self._startup_ok = bool(report["ok"])
         self._audit("reconcile_startup", report)
         return report
 
@@ -1449,8 +1527,8 @@ class ExecutionEngine:
             problems.append(str(d))
         derived: BotState | None = None
         why = ""
-        try:
-            rules = {s: self._rules(s, refresh=True) for s in (btc, usd)}
+        try:      # ONE /v1/markets read serves both symbols
+            rules = {s: self._rules(s, refresh=(i == 0)) for i, s in enumerate((btc, usd))}
             books: dict[str, OrderBook] = {}
             try:
                 books[btc] = self.exchange.get_order_book(btc)

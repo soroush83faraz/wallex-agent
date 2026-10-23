@@ -5,6 +5,18 @@
 """
 from __future__ import annotations
 
+import re
+
+_LABEL_RE = re.compile(r"[a-z_]{1,40}")
+
+
+def error_label(exc: BaseException) -> str:
+    """``TransportError[read_timeout]`` (type + transport category when known), else the type name.
+    Secret-free by construction: categories come from a fixed vocabulary."""
+    name = type(exc).__name__
+    cat = getattr(exc, "category", None)
+    return f"{name}[{cat}]" if isinstance(cat, str) and _LABEL_RE.fullmatch(cat) else name
+
 
 class WallexAgentError(Exception):
     """Base class for all package errors."""
@@ -19,7 +31,18 @@ class ExchangeError(WallexAgentError):
 
 
 class TransportError(ExchangeError):
-    """Network failure / timeout / connection reset. For a write, the outcome is unknown."""
+    """Network failure / timeout / connection reset. For a write, the outcome is unknown.
+
+    ``category`` (e.g. ``read_timeout``, ``proxy_connect_failed``; see ``exchange/net.py``), ``hint``
+    (one-line operator instruction) and ``phase`` (where it failed) are set by the HTTPS transport and
+    the client; all three are secret-free (the message is scrubbed by the client)."""
+
+    def __init__(self, message: str = "", *, category: str | None = None, hint: str | None = None,
+                 phase: str | None = None) -> None:
+        super().__init__(message)
+        self.category = category
+        self.hint = hint
+        self.phase = phase
 
 
 class ServerError(ExchangeError):

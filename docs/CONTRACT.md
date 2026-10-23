@@ -71,7 +71,9 @@ fail closed and report it (see `check-live` in §9).
 class Transport(Protocol):
     def request(self, method: str, url: str, headers: Mapping[str,str], body: bytes|None,
                 timeout: float) -> tuple[int, Mapping[str,str], bytes]: ...   # raises TransportError
-class UrllibTransport: ...                      # default, stdlib urllib, no redirects to other hosts
+class UrllibTransport: ...                      # default, stdlib urllib, verified TLS, no redirects; route =
+                                                # WALLEX_PROXY_URL / opted-in env proxy / direct (net.py);
+                                                # failures: TransportError(category, hint, phase)
 class TokenBucket: ...                          # uses Clock; blocking acquire(n=1)
 class WallexClient:                             # implements interfaces.Exchange
     def __init__(self, api_key: str|None, *, base_url="https://api.wallex.ir",

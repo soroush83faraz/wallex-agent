@@ -313,8 +313,10 @@ def cmd_diagnose(ctx: Ctx) -> int:
         books = {s: client.get_order_book(s) for s in (btc, usd)}
     except ExchangeError as exc:
         err(f"diagnose: public API unavailable: {type(exc).__name__}: {exc}")
-        if not cfg.use_env_proxy:
-            err("(if this host reaches Wallex only through a proxy, set WALLEX_USE_ENV_PROXY=true)")
+        if not cfg.use_env_proxy and not cfg.proxy_url:
+            err("(no proxy is configured: if this host reaches Wallex only through a proxy, set "
+                "WALLEX_PROXY_URL=http://host:port)")
+        err("`wallex-agent net-check` shows every network step (proxy, TLS, HTTP, bytes, timings).")
         return EXIT_UNAVAILABLE
     report["rules"] = {s: {"base": r.base, "quote": r.quote, "qty_decimals": r.qty_decimals,
                            "price_decimals": r.price_decimals, "min_qty": r.min_qty,
@@ -364,6 +366,277 @@ def cmd_diagnose(ctx: Ctx) -> int:
     out("Trading feasible now: " + ("YES (public facts only; the real fee is still unknown)" if
                                     report["trading_feasible_now"] else "NO: " + "; ".join(report["problems"])))
     return EXIT_OK
+
+
+# --------------------------------------------------------------------------- commands: network self-test
+def _trace_of(transport: Any) -> dict[str, Any] | None:
+    """The last request's trace of a UrllibTransport (possibly wrapped), as a dict; None otherwise."""
+    for obj in (transport, getattr(transport, "inner", None)):
+        tr = getattr(obj, "last_trace", None)
+        if tr is not None and callable(getattr(tr, "to_dict", None)):
+            return tr.to_dict()
+    return None
+
+
+def _ms(v: Any) -> str:
+    if v is None:
+        return "?"
+    v = float(v)
+    return f"{v / 1000:.1f} s" if v >= 10_000 else f"{v:.0f} ms"
+
+
+def _phases_text(t: Mapping[str, Any] | None) -> str:
+    """``connect 1 ms | CONNECT 200 in 3 ms | TLS 410 ms (TLSv1.3) | HTTP 200 after 7.0 s | 445418 bytes
+    (chunked) in 5.6 s | total 14.2 s`` (only the steps that happened)."""
+    if not t:
+        return "phases n/a (injected transport)"
+    ph = t.get("phases_ms") or {}
+    parts = []
+    if "connect" in ph:
+        parts.append(f"connect {_ms(ph['connect'])}")
+    if "proxy_connect" in ph or t.get("proxy_status") is not None:
+        parts.append(f"CONNECT {t.get('proxy_status') or 'no answer'} in {_ms(ph.get('proxy_connect'))}")
+    if "tls_handshake" in ph:
+        parts.append(f"TLS {_ms(ph['tls_handshake'])}" + (f" ({t['tls_version']})" if t.get("tls_version") else ""))
+    if t.get("status") is not None:
+        parts.append(f"HTTP {t['status']} after {_ms((ph.get('request') or 0.0) + (ph.get('response') or 0.0))}")
+    if t.get("bytes") is not None:
+        parts.append(f"{t['bytes']} bytes ({t.get('framing') or '?'}) in {_ms(ph.get('body'))}")
+    if t.get("elapsed_ms") is not None:
+        parts.append(f"total {_ms(t['elapsed_ms'])}")
+    return " | ".join(parts) or "no phase completed"
+
+
+def _net_failure(exc: BaseException, trace: Mapping[str, Any] | None, *, private: bool) -> dict[str, Any]:
+    """Category / detail / hint of a failed net-check step, and whether it is a NETWORK failure (exit 7)
+    or a check of a working connection (exit 6). Secret-free (and printed through the scrubber)."""
+    import re
+    from .errors import AuthError, RateLimitError, SchemaError, ServerError, TransportError
+    from .exchange.net import HTTP_STATUS, http_status_hint
+    text = str(exc).split(" | hint: ", 1)[0]
+    m = re.fullmatch(r"\S+ \S+: transport failure \[[a-z_]{1,40}\] (.*)", text, re.S)
+    if m:                                     # "GET /x: transport failure [cat] detail" -> "detail"
+        text = m.group(1)
+    status = (trace or {}).get("status")
+    if status is None:
+        m = re.search(r"HTTP ([0-9]{3})", text)
+        status = int(m.group(1)) if m else None
+    if isinstance(exc, TransportError):
+        return {"category": exc.category or "transport_other", "detail": text,
+                "hint": exc.hint or "run `wallex-agent net-check` again", "network": True}
+    if isinstance(exc, (ServerError, RateLimitError)):          # 5xx / 429 / ambiguous status
+        st = getattr(exc, "status", None) or status or (429 if isinstance(exc, RateLimitError) else None)
+        return {"category": HTTP_STATUS, "detail": f"HTTP {st}", "hint": http_status_hint(st), "network": True}
+    if isinstance(exc, AuthError) or (isinstance(exc, SchemaError) and status is not None
+                                      and not 200 <= status <= 299):
+        st = status if status is not None else 401
+        return {"category": HTTP_STATUS, "detail": text, "hint": http_status_hint(st, private=private),
+                "network": not (private and st in (401, 403))}
+    if isinstance(exc, SchemaError):
+        return {"category": "invalid_response", "detail": text, "network": False,
+                "hint": "the answer arrived but fails the strict schema/rules/book checks: the bot will not trade on it"}
+    return {"category": "unexpected", "detail": f"{type(exc).__name__}: {text}", "network": False,
+            "hint": "unexpected failure: see the detail"}
+
+
+def cmd_net_check(ctx: Ctx) -> int:
+    """GET-only connectivity self-test BEFORE trading: route, resolve, then /v1/markets and /v1/depth (both
+    symbols) through the production transport, each step with its phases; the trading rules and the
+    books; with a key also the private GETs through a READ-ONLY client. Writes nothing; never prints
+    the key, balances or proxy credentials."""
+    import platform
+    import socket
+    import ssl
+    from .errors import ExchangeError
+    from .exchange.net import IGNORE_UNEXPECTED_EOF
+    from .modes import network_transport
+    from .modes.live import read_only_client
+    from .modes.paper import public_client
+    cfg = ctx.config
+    a = ctx.args
+    repeat = int(a.repeat)
+    if not 1 <= repeat <= 10:
+        err("net-check: --repeat must be in [1, 10]")
+        return EXIT_USAGE
+    steps: list[dict[str, Any]] = []
+
+    def record(name: str, ok: bool, info: str = "", *, failure: Mapping[str, Any] | None = None,
+               trace: Mapping[str, Any] | None = None, show_phases: bool = True) -> None:
+        step: dict[str, Any] = {"step": name, "ok": ok, "info": info or None, "trace": trace}
+        if failure is not None:
+            step.update({k: failure.get(k) for k in ("category", "detail", "hint", "network")})
+        steps.append(step)
+        if ok:
+            out(f"[PASS] {name}: {info}" + (f"  [{_phases_text(trace)}]" if show_phases else ""))
+        else:
+            out(f"[FAIL] {name}: {step.get('category')}: {step.get('detail')}")
+            out(f"       hint: {step.get('hint')}")
+            if show_phases:
+                out(f"       phases: {_phases_text(trace)}")
+
+    out("net-check: GET-only connectivity self-test (no order is sent, nothing is written)")
+    import urllib.parse
+    bad_base = False
+    try:
+        parts = urllib.parse.urlsplit(cfg.api_base)
+        host, port = (parts.hostname or "").lower(), parts.port or 443
+    except ValueError:
+        bad_base = True
+    try:
+        transport = ctx.transport if ctx.transport is not None else network_transport(cfg)
+        client = public_client(cfg, transport=transport, clock=ctx.clock, max_read_retries=0)
+    except ConfigError as exc:
+        err(f"net-check: invalid configuration: {exc}")
+        return EXIT_USAGE
+    if bad_base or not host:
+        err("net-check: invalid API_BASE")
+        return EXIT_USAGE
+    settings = getattr(transport, "proxy_settings", None)
+    route: dict[str, Any] = settings.describe(host, port) if settings is not None else {
+        "route": "injected", "proxy": None, "target": f"{host}:{port}", "ignored_env": []}
+    if route["route"] == "proxy":
+        out(f"route:  proxy {route['proxy']} (from {route['source']}) -> CONNECT {route['target']} -> TLS to "
+            f"{host}, verified end-to-end through the tunnel")
+    elif route["route"] == "direct":
+        why = ("NO_PROXY matches the host, so the environment proxy is bypassed" if route.get("no_proxy_bypass")
+               else "no proxy configured")
+        out(f"route:  DIRECT to {route['target']} ({why})")
+    else:
+        out(f"route:  injected transport (tests) to {route['target']}")
+    if route.get("ignored_env"):
+        reason = ("WALLEX_PROXY_URL takes precedence" if cfg.proxy_url else
+                  "WALLEX_USE_ENV_PROXY is not true: set WALLEX_PROXY_URL=http://host:port (or "
+                  "WALLEX_USE_ENV_PROXY=true) to use a proxy" if not cfg.use_env_proxy else
+                  "another proxy variable takes precedence")
+        out(f"note:   {', '.join(route['ignored_env'])} set in the environment but NOT used ({reason})")
+    out(f"tls:    {ssl.OPENSSL_VERSION}, Python {platform.python_version()}; certificate + hostname verification "
+        f"ON, TLS >= 1.2; OP_IGNORE_UNEXPECTED_EOF {'on' if IGNORE_UNEXPECTED_EOF else 'not available'} "
+        "(a cut-short body is still an error)")
+    if route["route"] == "proxy" and cfg.api_key:
+        out("note:   through a proxy the exchange sees the PROXY's exit IP: it must be in the key's IP allow-list")
+
+    # 1. resolve the first hop (the proxy host, or the exchange host when direct)
+    if ctx.transport is None:
+        proxy = settings.route(host, port) if settings is not None else None
+        first_host, first_port = (proxy.host, proxy.port) if proxy is not None else (host, port)
+        label = f"resolve {first_host}" + (" (proxy host; the proxy resolves the exchange host)" if proxy else "")
+        t0 = time.perf_counter()
+        failed: BaseException | None = None
+        addrs: list[str] = []
+        try:
+            addrs = sorted({str(i[4][0]) for i in socket.getaddrinfo(first_host, first_port, type=socket.SOCK_STREAM)})
+        except OSError as exc:
+            failed = exc
+        took = (time.perf_counter() - t0) * 1000.0
+        if failed is not None:
+            from .exchange.net import diagnose
+            d = diagnose(failed, phase="connect", proxy=proxy, target=f"{host}:{port}")
+            failed = None
+            record(label, False, failure={"category": d.category, "detail": d.detail, "hint": d.hint, "network": True},
+                   show_phases=False)
+        else:
+            note = ""
+            if proxy is None and any(_is_reserved(x) for x in addrs):
+                note = " - WARNING: a private/reserved address for a public host (DNS filtering or a local override?)"
+            record(label, True, f"{', '.join(addrs[:4])} in {_ms(took)}{note}", show_phases=False)
+
+    # 2. public endpoints through the production transport (one attempt each: no hidden retries)
+    syms = (cfg.usdt_symbol, cfg.btc_symbol)
+    rules: dict[str, Any] = {}
+    for i in range(repeat):
+        name = "GET /v1/markets" + (f" ({i + 1}/{repeat})" if repeat > 1 else "")
+        try:
+            got = client.get_markets()
+        except ExchangeError as exc:
+            record(name, False, failure=_net_failure(exc, _trace_of(transport), private=False),
+                   trace=_trace_of(transport))
+        else:
+            rules = got
+            record(name, True, f"rules parsed for {', '.join(s for s in syms if s in got)}", trace=_trace_of(transport))
+    for s in syms if rules else ():
+        r = rules.get(s)
+        if r is None:
+            record(f"rules {s}", False, failure={"category": "invalid_response", "detail": "missing from /v1/markets",
+                                                 "hint": "the bot cannot trade this symbol", "network": False},
+                   show_phases=False)
+            continue
+        record(f"rules {s}", True, f"price decimals {r.price_decimals}, qty decimals {r.qty_decimals}, minQty "
+               f"{plain(r.min_qty)} {r.base}, minNotional {plain(r.min_notional)} {r.quote}"
+               + (f", maxQty {plain(r.max_qty)}" if r.max_qty is not None else ""), show_phases=False)
+    for s in syms:
+        for i in range(repeat):
+            name = f"GET /v1/depth?symbol={s}" + (f" ({i + 1}/{repeat})" if repeat > 1 else "")
+            try:
+                b = client.get_order_book(s)
+            except ExchangeError as exc:
+                record(name, False, failure=_net_failure(exc, _trace_of(transport), private=False),
+                       trace=_trace_of(transport))
+            else:
+                record(name, True, f"bid {plain(b.best_bid)} < ask {plain(b.best_ask)} (spread "
+                       f"{b.spread_bps.quantize(Decimal('0.01'))} bps, {len(b.bids)}/{len(b.asks)} levels): "
+                       "NOT crossed", trace=_trace_of(transport))
+
+    # 3. private GETs (key present): READ-ONLY client - every POST/DELETE is refused before any I/O
+    if not cfg.api_key:
+        out("[SKIP] private GETs: no WALLEX_API_KEY (public checks only)")
+    else:
+        pclient: Any = None
+        try:
+            pclient = read_only_client(cfg, transport=transport, clock=ctx.clock, max_read_retries=0)
+        except ConfigError as exc:
+            record("private client", False, failure={"category": "config", "detail": str(exc), "network": False,
+                                                     "hint": "fix WALLEX_API_KEY (it is never printed)"},
+                   show_phases=False)
+        if pclient is not None:
+            if not pclient.read_only:                     # pragma: no cover - read_only_client guarantees it
+                raise ConfigError("net-check needs a read-only client")
+            checks: list[tuple[str, Callable[[], str]]] = [
+                ("GET /v1/account/balances", lambda: f"{len(pclient.get_balances())} assets (amounts not shown)"),
+                ("GET /v1/account/fee", lambda: _fee_presence(pclient.get_fees(), syms)),
+                ("GET /v1/account/openOrders", lambda: f"{len(pclient.list_open_orders())} open orders"),
+                ("GET /v1/account/trades", lambda: f"{len(pclient.get_trades())} recent trades")]
+            for name, fn in checks:
+                try:
+                    info = fn()
+                except ExchangeError as exc:
+                    record(name, False, failure=_net_failure(exc, _trace_of(transport), private=True),
+                           trace=_trace_of(transport))
+                except ValueError as exc:                 # fee missing for a symbol (see _fee_presence)
+                    record(name, False, failure={"category": "invalid_response", "detail": str(exc),
+                                                 "hint": "the bot refuses to trade a symbol whose fee is unknown",
+                                                 "network": False}, trace=_trace_of(transport))
+                else:
+                    record(name, True, info, trace=_trace_of(transport))
+
+    failed_steps = [s for s in steps if not s["ok"]]
+    if not failed_steps:
+        out(f"net-check: PASS ({len(steps)} steps)")
+        code = EXIT_OK
+    else:
+        network = any(s.get("network") for s in failed_steps)
+        first = failed_steps[0]
+        out(f"net-check: FAIL ({len(failed_steps)} of {len(steps)} steps; first: {first['step']}: {first.get('category')})"
+            + (" - a NETWORK step failed (exit 7)" if network else " - the network works, a check failed (exit 6)"))
+        code = EXIT_UNAVAILABLE if network else EXIT_REFUSED
+    if a.json:
+        out(_json({"ok": not failed_steps, "exit_code": code, "route": route, "steps": steps}))
+    return code
+
+
+def _fee_presence(fees: Mapping[str, Any], syms: Sequence[str]) -> str:
+    missing = [s for s in syms if s not in fees]
+    if missing:
+        raise ValueError(f"fee unknown for {', '.join(missing)}")
+    return f"fee known for {', '.join(syms)}"
+
+
+def _is_reserved(addr: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local or ip.is_unspecified
 
 
 # --------------------------------------------------------------------------- commands: live gates
@@ -427,6 +700,12 @@ def cmd_canary(ctx: Ctx) -> int:
             err(f"canary refused: startup reconciliation not ok (state {rep.get('state')}): "
                 f"{rep.get('actions') or (rep.get('drift') or {}).get('text') or (rep.get('drift') or {}).get('reasons')}")
             return EXIT_STOPPED if rt.sm.state.value == "STOPPED" else EXIT_UNAVAILABLE
+        pf = rt.engine.preflight()       # rules (both symbols), both books fresh + non-crossed
+        if not pf.get("ok"):
+            err("canary refused (nothing sent): connectivity/reconcile preflight failed: "
+                + "; ".join(map(str, pf.get("problems") or [])) + ". Run `wallex-agent net-check` for the "
+                "step-by-step network diagnosis.")
+            return EXIT_UNAVAILABLE
         try:
             doc = run_canary(rt, should_stop=lambda: flag.reason)
         except CanaryRefused as exc:
@@ -842,6 +1121,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--tmn", help="TMN amount for the conversion math (default INITIAL_TMN)")
     s.set_defaults(func=cmd_diagnose)
 
+    s = add("net-check", "GET-only connectivity self-test (route, DNS, proxy, TLS, HTTP, rules, books): run before trading",
+            "Checks, step by step and with the production transport, the network route the bot will use: the route "
+            "(WALLEX_PROXY_URL; or HTTPS_PROXY/HTTP_PROXY/NO_PROXY with WALLEX_USE_ENV_PROXY=true; else direct - the OS "
+            "proxy settings are never used), name resolution of the first hop, then GET /v1/markets and GET /v1/depth "
+            "for USDTTMN and BTCUSDT, each with its phases (TCP connect, proxy CONNECT status, TLS handshake, HTTP "
+            "status, bytes, elapsed). Prints the trading rules (price/qty decimals, minQty, minNotional) and confirms "
+            "both books are not crossed. With WALLEX_API_KEY it also runs the private GETs through a READ-ONLY client "
+            "(POST/DELETE impossible) and prints neither the key nor any balance. Sends no order, writes nothing, "
+            "never retries silently (one attempt per request). Exit 0 = every step passed; 7 = a network step "
+            "failed (its category and a one-line hint are printed); 6 = the network works but a check failed "
+            "(invalid rules, crossed book, key refused, fee unknown); 2 = invalid proxy/base-URL configuration.")
+    s.add_argument("--repeat", type=int, default=1,
+                   help="request each endpoint N times (1-10) to expose intermittent failures (default 1)")
+    s.add_argument("--json", action="store_true", help="also print the full JSON report")
+    s.set_defaults(func=cmd_net_check)
+
     s = add("paper", "paper trading: live public books, simulated orders (never sends an order)",
             "Paper mode: the agent sees real public Wallex books but every order, fill and balance is "
             "simulated in-process. The only network client is public-only (no key, GET of public "
@@ -956,18 +1251,27 @@ def _default_mode(env: Mapping[str, str] | None, dotenv_path: str | None) -> Mod
         raise ConfigError(f"bad value for TRADING_MODE: {raw!r}") from exc
 
 
+_PROXY_VARS = ("WALLEX_PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY",
+               "all_proxy")
+
+
 def _secrets_from(env: Mapping[str, str] | None, dotenv_path: str | None) -> list[str]:
+    """Literal secrets the output scrubber removes: the API key, and the credentials of any proxy URL
+    (WALLEX_PROXY_URL / *_PROXY) - those are never printed anyway (proxies are shown masked)."""
+    from .exchange.net import credential_forms
     vals = []
     src = os.environ if env is None else env
-    if src.get("WALLEX_API_KEY"):
-        vals.append(src["WALLEX_API_KEY"])
+    dot: Mapping[str, str] = {}
     if dotenv_path and Path(dotenv_path).is_file():
         try:
-            k = parse_dotenv(Path(dotenv_path).read_text(encoding="utf-8")).get("WALLEX_API_KEY")
+            dot = parse_dotenv(Path(dotenv_path).read_text(encoding="utf-8"))
         except OSError:
-            k = None
-        if k:
-            vals.append(k)
+            dot = {}
+    for m in (src, dot):
+        if m.get("WALLEX_API_KEY"):
+            vals.append(m["WALLEX_API_KEY"])
+        for name in _PROXY_VARS:
+            vals.extend(credential_forms(m.get(name)))
     return vals
 
 
